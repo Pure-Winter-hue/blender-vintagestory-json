@@ -193,7 +193,7 @@ def parse_element(
         rot_euler[0] = e["rotationZ"] * DEG_TO_RAD
 
     # create cube
-    bpy.ops.mesh.primitive_cube_add(location=location, rotation=rot_euler)
+    bpy.ops.mesh.primitive_cube_add(location=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0))
     obj = bpy.context.active_object
     obj.rotation_mode = 'XZY'
     mesh = obj.data
@@ -305,7 +305,7 @@ def parse_element(
     if "stepParentName" in e:
         obj["StepParentName"] = e.get("stepParentName")
 
-    return obj, v_min, new_cube_origin, new_rotation_origin
+    return obj, v_min, new_cube_origin, new_rotation_origin, location, rot_euler
 
 
 def parse_attachpoint(
@@ -339,9 +339,11 @@ def parse_attachpoint(
     rotation = DEG_TO_RAD * np.array([rz, rx, ry])
 
     # create object
-    bpy.ops.object.empty_add(type="ARROWS", radius=1.0, location=location, rotation=rotation)
+    bpy.ops.object.empty_add(type="ARROWS", radius=1.0, location=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0))
     obj = bpy.context.active_object
     obj.show_in_front = True
+    obj['vs_desired_loc'] = [float(location[0]), float(location[1]), float(location[2])]
+    obj['vs_desired_rot'] = [float(rotation[0]), float(rotation[1]), float(rotation[2])]
     obj.name = "attach_" + (e.get("code") or "attachpoint")
 
     return obj
@@ -599,7 +601,7 @@ def load_element(
 ):
     """Recursively load a geometry cuboid"""
 
-    obj, local_cube_origin, new_cube_origin, new_rotation_origin = parse_element(
+    obj, local_cube_origin, new_cube_origin, new_rotation_origin, desired_loc, desired_rot = parse_element(
         element,
         cube_origin,
         rotation_origin,
@@ -613,6 +615,14 @@ def load_element(
     # set parent
     if parent is not None:
         obj.parent = parent
+        # We want VS transforms to be interpreted in parent space (not world space).
+        # Force parent inverse to identity so obj.matrix_basis is direct local transform.
+        obj.matrix_parent_inverse = Matrix.Identity(4)
+        obj.rotation_mode = 'XZY'
+        obj.matrix_basis = Matrix.Translation(Vector(desired_loc)) @ Euler(desired_rot, 'XZY').to_matrix().to_4x4()
+    else:
+        obj.rotation_mode = 'XZY'
+        obj.matrix_world = Matrix.Translation(Vector(desired_loc)) @ Euler(desired_rot, 'XZY').to_matrix().to_4x4()
     
     # increment stats (debugging)
     if stats:
@@ -626,6 +636,13 @@ def load_element(
                 local_cube_origin,
             )
             p.parent = obj
+            try:
+                if 'vs_desired_loc' in p and 'vs_desired_rot' in p:
+                    p.matrix_parent_inverse = Matrix.Identity(4)
+                    p.rotation_mode = 'XZY'
+                    p.matrix_basis = Matrix.Translation(Vector(p['vs_desired_loc'])) @ Euler(p['vs_desired_rot'], 'XZY').to_matrix().to_4x4()
+            except Exception:
+                pass
             all_objects.append(p)
             
             # increment stats (debugging)
@@ -638,8 +655,8 @@ def load_element(
             load_element(
                 child,
                 obj,
-                new_cube_origin,
-                new_rotation_origin,
+                local_cube_origin,
+                np.array([0.0, 0.0, 0.0]),
                 all_objects,
                 textures,
                 tex_width,
