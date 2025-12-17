@@ -1,9 +1,9 @@
 bl_info = {
     "name": "Vintage Story JSON Import/Export",
     "description": "Vintage Story JSON import/export",
-    "author": "phonon",
-    "version": (0, 8, 0),
-    "blender": (4, 5, 2),
+    "author": "phonon, Pure Winter",
+    "version": (0, 8, 5),
+    "blender": (4, 5, 5),
     "location": "File > Import-Export",
     "warning": "",
     "tracker_url": "https://github.com/phonon/blender-vintagestory-json",

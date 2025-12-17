@@ -42,9 +42,9 @@ class ImportVintageStoryJson(Operator, ImportHelper):
 
     # applies default shift from vintagestory origin
     do_translate_origin: BoolProperty(
-        name="Translate Origin",
-        description="Translate model origin after import",
-        default=True,
+        name="Center Back on Origin",
+        description="Shift the imported model back onto the scene origin (0,0,0)",
+        default=False,
     )
     
     translate_origin_x: FloatProperty(
@@ -174,9 +174,9 @@ class ExportVintageStoryJson(Operator, ExportHelper):
 
     # applies default shift from vintagestory origin
     do_translate_origin: BoolProperty(
-        name="Translate Origin",
-        description="Translate model origin after export",
-        default=True,
+        name="Center Back on Origin",
+        description="Shift the exported model back onto the origin (0,0,0)",
+        default=False,
     )
     
     translate_origin_x: FloatProperty(
@@ -267,39 +267,15 @@ class ExportVintageStoryJson(Operator, ExportHelper):
 
     # ================================
     # animation options
-    export_armature: BoolProperty(
-        name="Export Armature",
-        description="Export by main armature tree",
-        default=True,
-    )
-
     export_animations: BoolProperty(
         name="Export Animations",
-        description="Export bone animations keyframes",
+        description="Export animations keyframes",
         default=True,
     )
 
     generate_animations_file: BoolProperty(
         name="Generate Animations File",
         description="Generate separate animations .json file",
-        default=False,
-    )
-
-    use_main_object_as_bone: BoolProperty(
-        name="Use Main Object as Bone",
-        description="Use main object with same transform as bone instead of dummy bone",
-        default=True,
-    )
-
-    rotate_shortest_distance: BoolProperty(
-        name="Rotate Shortest Distance",
-        description="Use shortest distance interpolation for rotation keyframes",
-        default=False,
-    )
-    
-    animation_version_0: BoolProperty(
-        name="Use Animation Version 0",
-        description="Use old vintagestory animation format with incompatible transform order",
         default=False,
     )
 
@@ -337,10 +313,20 @@ class ExportVintageStoryJson(Operator, ExportHelper):
             if prop not in self.skip_save_props:
                 bpy.context.scene["vintagestory_export_" + prop] = val
         
+        # Do NOT filter to root objects.
+        # VS models imported by this addon are typically bone-parented, so filtering to roots
+        # would drop all cuboid elements and leave only the armature.
         if self.selection_only:
-            args["objects"] = export_vintagestory_json.filter_root_objects(bpy.context.selected_objects)
+            objs = list(bpy.context.selected_objects)
         else:
-            args["objects"] = export_vintagestory_json.filter_root_objects(bpy.context.scene.collection.all_objects[:])
+            objs = list(bpy.context.scene.collection.all_objects[:])
+
+        # Ensure any referenced armatures are included.
+        for o in list(objs):
+            p = getattr(o, "parent", None)
+            if p is not None and p.type == "ARMATURE" and p not in objs:
+                objs.append(p)
+        args["objects"] = objs
         return run_export(self, **args)
 
     def draw(self, context):
@@ -372,9 +358,14 @@ class ExportVintageStoryJsonQuick(bpy.types.Operator):
                 args[prop[20:]] = val
         
         if "selection_only" in args and args["selection_only"] == True:
-            args["objects"] = export_vintagestory_json.filter_root_objects(bpy.context.selected_objects)
+            objs = list(bpy.context.selected_objects)
         else:
-            args["objects"] = export_vintagestory_json.filter_root_objects(bpy.context.scene.collection.all_objects[:])
+            objs = list(bpy.context.scene.collection.all_objects[:])
+        for o in list(objs):
+            p = getattr(o, "parent", None)
+            if p is not None and p.type == "ARMATURE" and p not in objs:
+                objs.append(p)
+        args["objects"] = objs
 
         # get blender filepath
         # https://github.com/dfelinto/blender/blob/master/release/scripts/modules/bpy_extras/io_utils.py#L56
@@ -446,8 +437,13 @@ class ExportVintageStoryJsonCollection(bpy.types.Operator):
 
         args = {
             "filepath": save_filepath,
-            "objects": export_vintagestory_json.filter_root_objects(collection_to_export.all_objects),
+            "objects": list(collection_to_export.all_objects),
         }
+
+        for o in list(args["objects"]):
+            p = getattr(o, "parent", None)
+            if p is not None and p.type == "ARMATURE" and p not in args["objects"]:
+                args["objects"].append(p)
         
         # gather export args stored in scene
         for prop, val in bpy.context.scene.items():
@@ -505,7 +501,12 @@ class ExportVintageStoryJsonHighlightedCollections(bpy.types.Operator):
         for collection_to_export in highlighted_collections:
             # collection specific args, re-write for each collection
             args["filepath"] = os.path.join(save_dir, collection_to_export.name + ".json")
-            args["objects"] = export_vintagestory_json.filter_root_objects(collection_to_export.all_objects)
+            args["objects"] = list(collection_to_export.all_objects)
+
+            for o in list(args["objects"]):
+                p = getattr(o, "parent", None)
+                if p is not None and p.type == "ARMATURE" and p not in args["objects"]:
+                    args["objects"].append(p)
 
             run_export(self, **args)
 
@@ -618,12 +619,8 @@ class VINTAGESTORY_PT_export_animation(bpy.types.Panel):
         sfile = context.space_data
         operator = sfile.active_operator
 
-        layout.prop(operator, "export_armature")
         layout.prop(operator, "export_animations")
         layout.prop(operator, "generate_animations_file")
-        layout.prop(operator, "use_main_object_as_bone")
-        layout.prop(operator, "rotate_shortest_distance")
-        layout.prop(operator, "animation_version_0")
 
 
 class VINTAGESTORY_PT_export_scripts(bpy.types.Panel):
