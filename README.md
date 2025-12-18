@@ -1,10 +1,49 @@
-Winter's Development Branch
+# Winter's Development Branch
 
--Slowly making a "new" blender tool, reflavored from main branch.-
-+Adds mirror button which duplicates, auto renames L or Left to R or Right, and flips geometry/bones in relation to cursor (so put it on world origin.)
-+Assigns 'skin' material and removes all other mats (so no 'null')
-+Renames mesh data to match object data so no hidden decimals in json (on import and export- decimals are not good for a json m'kay.)
-+Supports animation import/export without fuss.
-+Adds a new UV unwrap mode "View to Bounds" which captures all 6 cuboid directions and speeds up UV layouts.
+A slowly evolving “new” Blender tool, reflavored from the main branch.
 
-HIGHLY EXPERIMENTAL 
+**Status:** ⚠️ Highly Experimental
+
+---
+
+## Features
+
+- **Mirror Button**
+  - Duplicates selection
+  - Auto-renames `L`/`Left` → `R`/`Right`
+  - Flips geometry and bones relative to the **3D Cursor**
+    - Tip: place the cursor at **World Origin** for the intended workflow
+
+- **Single Material Workflow**
+  - Removes all materials and assigns a single default material: **`skin`**
+  - Prevents `null` materials
+
+- **Clean JSON Names (No Hidden Decimals)**
+  - Renames mesh data to match object names
+  - Runs on **import and export**
+  - Helps avoid Blender-style suffixes like `.001` ending up in exported JSON
+
+- **Animation Import/Export**
+  - Imports and exports Vintage Story animations with minimal fuss
+
+- **UV Unwrap: “View to Bounds”**
+  - New unwrap mode designed for cuboids
+  - Captures all **6 directions** of a model (press the 'Make Cuboid (rectify)' after, otherwise it auto-does this on export)
+  - Speeds up UV layout work
+
+---
+
+## Notes
+
+- This branch is under active development and may change rapidly.
+- Expect rough edges, weirdness, and the occasional gremlin 🐛
+
+---
+
+## Contributing / Feedback
+
+Issues, repro files, and screenshots are welcome.
+If something breaks, include:
+- Blender version
+- Model JSON (or a minimal sample)
+- Steps to reproduce
