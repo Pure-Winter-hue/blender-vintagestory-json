@@ -143,6 +143,13 @@ class VINTAGESTORY_PT_panel_model_tools(bpy.types.Panel):
             text="Cleanup Rotation",
         )
 
+        # operator: mirror selected objects without negative scales (VS JSON safe)
+        layout.operator(
+            operator="vintagestory.mirror_selected_safe",
+            icon="MOD_MIRROR",
+            text="Mirror (Safe for VS JSON)",
+        )
+
 
 # =============================================================================
 # UV tools
@@ -170,6 +177,24 @@ class VINTAGESTORY_PT_panel_texture_tools(bpy.types.Panel):
             operator="vintagestory.uv_cuboid_unwrap",
             icon="UV_DATA",
             text="Cuboid UV Unwrap",
+        )
+        # operator: unwrap selected cuboids based on current viewport orientation
+        layout.operator(
+            operator="vintagestory.uv_cuboid_unwrap_project_from_view",
+            icon="UV_DATA",
+            text="Cuboid UV Unwrap (View)",
+        )
+        # operator: unwrap selected cuboids based on current viewport orientation (fit inside UV bounds)
+        layout.operator(
+            operator="vintagestory.uv_cuboid_unwrap_project_from_view_to_bounds",
+            icon="UV_DATA",
+            text="Cuboid UV Unwrap (View to Bounds)",
+        )
+        # operator: rectify existing UVs into cuboid-rectangle faces (for export to VSMC etc)
+        layout.operator(
+            operator="vintagestory.uv_make_cuboid_uv",
+            icon="UV_DATA",
+            text="Make Cuboid UV (Rectify)",
         )
         # operator: unwrap selected objects UVs into single pixel
         layout.operator(
@@ -423,6 +448,7 @@ classes = [
     primitive.OpPrimitiveAddHexadecagonHollow,
     primitive.OpPrimitiveAddOctsphere,
     model.OpDuplicateCollection,
+    model.OpMirrorSelectedSafe,
     model.OpCleanupRotation,
     animation.OpMakeBonesXZY,
     animation.OpAssignBones,
@@ -434,6 +460,9 @@ classes = [
     animation.OpActionOnActivityStopped,
     texture.OpAssignGlow,
     texture.OpUVCuboidUnwrap,
+    texture.OpUVCuboidUnwrapProjectFromView,
+    texture.OpUVCuboidUnwrapProjectFromViewToBounds,
+    texture.OpUVCuboidMakeCuboidUV,
     texture.OpUVPixelUnwrap,
     texture.OpUVPackSimpleBoundingBox,
     texture.OpDisableMaterial,

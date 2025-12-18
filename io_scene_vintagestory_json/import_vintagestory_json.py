@@ -19,7 +19,7 @@ importlib.reload(animation)
 # convert deg to rad
 DEG_TO_RAD = math.pi / 180.0
 
-# direction names for minecraft cube face UVs
+# direction names for vs cube face UVs
 DIRECTIONS = np.array([
     "north",
     "east",
@@ -29,8 +29,8 @@ DIRECTIONS = np.array([
     "down",
 ])
 
-# normals for minecraft directions in BLENDER world space
-# e.g. blender (-1, 0, 0) is minecraft north (0, 0, -1)
+# normals for vs directions in BLENDER world space
+# e.g. blender (-1, 0, 0) is vs north (0, 0, -1)
 # shape (f,n,v) = (6,6,3)
 #   f = 6: number of cuboid faces to test
 #   n = 6: number of normal directions
@@ -213,96 +213,192 @@ def parse_element(
     mesh.vertices[5].co[:] = v_max[0], v_min[1], v_max[2]
     mesh.vertices[6].co[:] = v_max[0], v_max[1], v_min[2]
     mesh.vertices[7].co[:] = v_max[0], v_max[1], v_max[2]
-
     # set face uvs
-    uv = e.get("faces")
-    if uv is not None:
-        if import_uvs:
-            face_normals = np.zeros((6,1,3))
-            for i, face in enumerate(mesh.polygons):
-                face_normals[i,0,0:3] = face.normal
-            
-            # map face normal -> face name
-            # NOTE: this process may not be necessary since new blender
-            # objects are created with the same face normal order,
-            # so could directly map index -> minecraft face name.
-            # keeping this in case the order changes in future
-            face_directions = np.argmax(np.sum(face_normals * DIRECTION_NORMALS, axis=2), axis=1)
-            face_directions = DIRECTIONS[face_directions]
+    uv_faces = e.get("faces") or {}
+    element_uv = e.get("uv")
+    element_uv0 = None
+    if isinstance(element_uv, (list, tuple)) and len(element_uv) == 2:
+        try:
+            element_uv0 = (float(element_uv[0]), float(element_uv[1]))
+        except Exception:
+            element_uv0 = None
 
-            # set uvs face order in blender loop, determined experimentally
-            uv_layer = mesh.uv_layers.active.data
-            for uv_direction, face in zip(face_directions, mesh.polygons):
-                face_uv = uv.get(uv_direction)
-                if face_uv is not None:
-                    if "uv" in face_uv:
-                        # unpack uv coords in minecraft coord space [xmin, ymin, xmax, ymax]
-                        # transform from minecraft [0, 16] space +x,-y space to blender [0,1] +x,+y
-                        face_uv_coords = face_uv["uv"]
-                        xmin = face_uv_coords[0] / tex_width
-                        ymin = 1.0 - face_uv_coords[3] / tex_height
-                        xmax = face_uv_coords[2] / tex_width
-                        ymax = 1.0 - face_uv_coords[1] / tex_height
-                    else:
-                        xmin = 0.0
-                        ymin = 1.0
-                        xmax = 1.0
-                        ymax = 0.0
-                    
-                    # write uv coords based on rotation
-                    rotation = 0
-                    if "rotation" in face_uv:
-                        rotation = face_uv["rotation"]
-                    if uv_direction == "down":
-                        rotation = (rotation + 180) % 360
-                    k = face.loop_start
-                    if rotation == 0:
-                        uv_layer[k].uv[0:2] = xmax, ymin
-                        uv_layer[k+1].uv[0:2] = xmax, ymax
-                        uv_layer[k+2].uv[0:2] = xmin, ymax
-                        uv_layer[k+3].uv[0:2] = xmin, ymin
+    # Precompute "autoUv" rectangles from element-level uv offset (VSMC style).
+    # Many VSMC/Vintage Story shapes use element["uv"] with face["autoUv"]=true and omit explicit per-face uv rectangles.
+    auto_uv_rects = None
+    if element_uv0 is not None:
+        try:
+            # JSON coords: x, y, z
+            dx = abs(x2 - x1)
+            dy = abs(y2 - y1)
+            dz = abs(z2 - z1)
+            u0, v0 = element_uv0
 
-                    elif rotation == 90:
-                        uv_layer[k].uv[0:2] = xmax, ymax
-                        uv_layer[k+1].uv[0:2] = xmin, ymax
-                        uv_layer[k+2].uv[0:2] = xmin, ymin
-                        uv_layer[k+3].uv[0:2] = xmax, ymin
+            # Standard box net (matches common model creators derived from MrCrayfish's Model Creator):
+            #   [  up  ][ down ]
+            # [west][north][east][south]
+            # (Coordinates are in pixel units in VS JSON space: origin top-left, +v downward.)
+            auto_uv_rects = {
+                "west":  (u0,            v0 + dz,       u0 + dz,            v0 + dz + dy),
+                "north": (u0 + dz,       v0 + dz,       u0 + dz + dx,       v0 + dz + dy),
+                "east":  (u0 + dz + dx,  v0 + dz,       u0 + dz + dx + dz,  v0 + dz + dy),
+                "south": (u0 + dz + dx + dz, v0 + dz,   u0 + dz + dx + dz + dx, v0 + dz + dy),
+                "up":    (u0 + dz,       v0,            u0 + dz + dx,       v0 + dz),
+                "down":  (u0 + dz + dx,  v0,            u0 + dz + dx + dx,  v0 + dz),
+            }
+        except Exception:
+            auto_uv_rects = None
 
-                    elif rotation == 180:
-                        uv_layer[k].uv[0:2] = xmin, ymax
-                        uv_layer[k+1].uv[0:2] = xmin, ymin
-                        uv_layer[k+2].uv[0:2] = xmax, ymin
-                        uv_layer[k+3].uv[0:2] = xmax, ymax
+    def _interpret_vs_uv_rect(uv4, tex_w, tex_h):
+        """Interpret a VS/VSMC uv array as either [x1,y1,x2,y2] or [x,y,w,h].
 
-                    elif rotation == 270:
-                        uv_layer[k].uv[0:2] = xmin, ymin
-                        uv_layer[k+1].uv[0:2] = xmax, ymin
-                        uv_layer[k+2].uv[0:2] = xmax, ymax
-                        uv_layer[k+3].uv[0:2] = xmin, ymax
+        Returns (xmin, ymin, xmax, ymax) in VS pixel space (top-left origin).
+        """
+        try:
+            u0, v0, u2, v2 = [float(v) for v in uv4]
+        except Exception:
+            return None
 
-                    else: # invalid rotation, should never occur... do default
-                        uv_layer[k].uv[0:2] = xmax, ymin
-                        uv_layer[k+1].uv[0:2] = xmax, ymax
-                        uv_layer[k+2].uv[0:2] = xmin, ymax
-                        uv_layer[k+3].uv[0:2] = xmin, ymin
+        # Candidate A: [x1,y1,x2,y2]
+        a = (u0, v0, u2, v2)
 
-                    # assign material
-                    if "texture" in face_uv:
-                        tex_name = face_uv["texture"][1:] # remove the "#" in start
-                        if tex_name in mesh_materials:
-                            face.material_index = mesh_materials[tex_name]
-                        else:
-                            if not tex_name in textures:
-                                textures[tex_name] = create_textured_principled_bsdf(tex_name, tex_name, 2, tex_width, tex_height)
-                            idx = len(obj.data.materials)
-                            obj.data.materials.append(textures[tex_name])
-                            mesh_materials[tex_name] = idx
-                            face.material_index = idx
+        # Candidate B: [x,y,w,h] -> [x1,y1,x1+w,y1+h]
+        b = (u0, v0, u0 + u2, v0 + v2)
+
+        def ok(rect):
+            x1_, y1_, x2_, y2_ = rect
+            # allow swapped coords (flips), but require non-zero area
+            if abs(x2_ - x1_) < 1e-6 or abs(y2_ - y1_) < 1e-6:
+                return False
+            # bounds check (loose)
+            xmn, xmx = (min(x1_, x2_), max(x1_, x2_))
+            ymn, ymx = (min(y1_, y2_), max(y1_, y2_))
+            eps = 1e-3
+            return (xmx <= tex_w + eps) and (ymx <= tex_h + eps) and (xmn >= -eps) and (ymn >= -eps)
+
+        a_ok = ok(a)
+        b_ok = ok(b)
+
+        if a_ok and not b_ok:
+            return a
+        if b_ok and not a_ok:
+            return b
+        if a_ok and b_ok:
+            # Prefer the VS engine/our exporter convention when both are plausible.
+            return a
+
+        # neither passes strict checks, fall back to A
+        return a
+
+    if import_uvs and (uv_faces or auto_uv_rects is not None):
+        # get uvs per face in blender loop order
+        uv_layer = mesh.uv_layers.active.data
+
+        # Detect mesh face directions from normals.
+        # We compute the best matching direction by dot-product against the
+        # canonical face normals (same approach as the original importer).
+        face_normals = np.zeros((len(mesh.polygons), 1, 3), dtype=float)
+        for i, face in enumerate(mesh.polygons):
+            # face.normal is a mathutils.Vector
+            face_normals[i, 0, 0:3] = face.normal
+
+        # Map face normal -> direction index, then to direction name.
+        # DIRECTION_NORMALS has shape (6,6,3) and broadcasts against (F,1,3)
+        # producing (F,6,3) before summing over vector components.
+        dir_idx = np.argmax(np.sum(face_normals * DIRECTION_NORMALS, axis=2), axis=1)
+        face_directions = DIRECTIONS[dir_idx]
+
+        for uv_direction, face in zip(face_directions, mesh.polygons):
+            face_uv = uv_faces.get(uv_direction)
+
+            # Determine whether we should use explicit UVs or auto UVs
+            use_autouv = False
+            rotation = 0
+
+            if isinstance(face_uv, dict):
+                rotation = int(face_uv.get("rotation") or 0)
+                # In many VSMC exports, autoUv defaults to true when explicit uv isn't present.
+                if (face_uv.get("autoUv", True) is True) and ("uv" not in face_uv):
+                    use_autouv = True
+            else:
+                face_uv = None
+
+            # choose UV rectangle in VS pixel space
+            if face_uv is not None and "uv" in face_uv:
+                uv_rect = _interpret_vs_uv_rect(face_uv.get("uv"), tex_width, tex_height)
+                if uv_rect is None:
+                    uv_rect = (0.0, 0.0, tex_width, tex_height)
+                xmin_px, ymin_px, xmax_px, ymax_px = uv_rect
+            elif use_autouv and auto_uv_rects is not None and uv_direction in auto_uv_rects:
+                xmin_px, ymin_px, xmax_px, ymax_px = auto_uv_rects[uv_direction]
+            elif auto_uv_rects is not None and uv_direction in auto_uv_rects and face_uv is None:
+                # faces missing entirely, but element has UV offset: assume auto unwrap
+                xmin_px, ymin_px, xmax_px, ymax_px = auto_uv_rects[uv_direction]
+            else:
+                # default full map
+                xmin_px, ymin_px, xmax_px, ymax_px = (0.0, 0.0, tex_width, tex_height)
+
+            # convert VS coords (top-left origin) to Blender normalized UVs (bottom-left origin)
+            xmin = xmin_px / tex_width
+            ymin = 1.0 - (ymax_px / tex_height)
+            xmax = xmax_px / tex_width
+            ymax = 1.0 - (ymin_px / tex_height)
+
+            if uv_direction == "down":
+                rotation = (rotation + 180) % 360
+
+            # apply rotation
+            k = face.loop_start
+            if rotation == 0:
+                uv_layer[k].uv[0:2] = xmax, ymin
+                uv_layer[k+1].uv[0:2] = xmax, ymax
+                uv_layer[k+2].uv[0:2] = xmin, ymax
+                uv_layer[k+3].uv[0:2] = xmin, ymin
+
+            elif rotation == 90:
+                uv_layer[k].uv[0:2] = xmax, ymax
+                uv_layer[k+1].uv[0:2] = xmin, ymax
+                uv_layer[k+2].uv[0:2] = xmin, ymin
+                uv_layer[k+3].uv[0:2] = xmax, ymin
+
+            elif rotation == 180:
+                uv_layer[k].uv[0:2] = xmin, ymax
+                uv_layer[k+1].uv[0:2] = xmin, ymin
+                uv_layer[k+2].uv[0:2] = xmax, ymin
+                uv_layer[k+3].uv[0:2] = xmax, ymax
+
+            elif rotation == 270:
+                uv_layer[k].uv[0:2] = xmin, ymin
+                uv_layer[k+1].uv[0:2] = xmax, ymin
+                uv_layer[k+2].uv[0:2] = xmax, ymax
+                uv_layer[k+3].uv[0:2] = xmin, ymax
+
+            else:  # invalid rotation, should never occur... do default
+                uv_layer[k].uv[0:2] = xmax, ymin
+                uv_layer[k+1].uv[0:2] = xmax, ymax
+                uv_layer[k+2].uv[0:2] = xmin, ymax
+                uv_layer[k+3].uv[0:2] = xmin, ymin
+
+            # assign material (kept for compatibility; post-import we collapse to a single 'skin' material)
+            if face_uv is not None and "texture" in face_uv:
+                tex_name = face_uv["texture"][1:]  # remove the "#" in start
+                if tex_name in mesh_materials:
+                    face.material_index = mesh_materials[tex_name]
+                else:
+                    if not tex_name in textures:
+                        textures[tex_name] = create_textured_principled_bsdf(tex_name, tex_name, 2, tex_width, tex_height)
+                    idx = len(obj.data.materials)
+                    obj.data.materials.append(textures[tex_name])
+                    mesh_materials[tex_name] = idx
+                    face.material_index = idx
+
 
     # set name (store VS name for animation mapping; Blender names may normalize whitespace)
     vs_name = e.get("name") or "cube"
     obj["vs_name"] = vs_name
     obj.name = vs_name.strip()
+    # Remember the Blender-visible name at import time so we can detect user renames later
+    obj["vs_import_blender_name"] = obj.name
 
     # assign step parent name
     if "stepParentName" in e:
@@ -395,6 +491,7 @@ def rebuild_hierarchy_with_bones(root_objects):
 
         vs_name = o.get("vs_name", bname)
         eb["vs_name"] = vs_name  # store original VS name for later mapping
+        eb["vs_import_blender_name"] = bname
 
         # object world matrix -> armature local matrix
         mat = armature_obj.matrix_world.inverted_safe() @ o.matrix_world
@@ -789,6 +886,8 @@ def load(context,
     # objects created
     root_objects = []  # root level objects
     all_objects = []   # all objects added
+    armature = None  # created if animations are imported
+
 
     # vintage story coordinate system origin
     if translate_origin is not None:
@@ -813,6 +912,16 @@ def load(context,
     """
     tex_width = data["textureWidth"] if "textureWidth" in data else 16.0
     tex_height = data["textureHeight"] if "textureHeight" in data else 16.0
+
+    # Store declared texture size on the scene so exports can scale UVs correctly (e.g. for VSMC).
+    # This avoids relying on image node sizes, which may be scaled for authoring convenience.
+    try:
+        scn = bpy.context.scene
+        scn["vs_textureWidth"] = float(tex_width)
+        scn["vs_textureHeight"] = float(tex_height)
+    except Exception:
+        pass
+
     textures = {}
     if import_textures and "textures" in data:
         # get textures base path for models
@@ -970,6 +1079,96 @@ def load(context,
         if first_action is not None:
             armature.animation_data.action = first_action
     
+
+    # =============================================
+    # Post-import cleanup
+    # =============================================
+
+    def _vs_sync_object_data_names(objs):
+        """Make datablock names match object names for unique users.
+        Helps keep Mesh/Armature datablocks stable for export and editing."""
+        for o in objs:
+            data = getattr(o, "data", None)
+            if data is None:
+                continue
+            try:
+                if getattr(data, "users", 0) == 1:
+                    data.name = o.name
+            except Exception:
+                pass
+
+    def _vs_postprocess_single_skin(mesh_objs):
+        """Remove all materials on imported meshes and assign a single shared 'skin' material."""
+        # Create or get the shared material
+        skin = bpy.data.materials.get("skin")
+        if skin is None:
+            skin = bpy.data.materials.new("skin")
+            try:
+                skin.use_nodes = True
+            except Exception:
+                pass
+
+        # Track materials that were previously used by imported meshes so we can purge unused ones.
+        prev_mats = set()
+        for o in mesh_objs:
+            try:
+                for m in getattr(o.data, "materials", []) or []:
+                    if m is not None:
+                        prev_mats.add(m)
+            except Exception:
+                pass
+
+        # Clear + assign only skin
+        for o in mesh_objs:
+            me = getattr(o, "data", None)
+            if not isinstance(me, bpy.types.Mesh):
+                continue
+
+            # clear material slots
+            try:
+                me.materials.clear()
+            except Exception:
+                # fallback for older APIs
+                while len(me.materials) > 0:
+                    me.materials.pop(index=len(me.materials) - 1)
+
+            me.materials.append(skin)
+
+            # force all faces to material slot 0
+            try:
+                polys = getattr(me, "polygons", None)
+                if polys is not None:
+                    for p in polys:
+                        p.material_index = 0
+            except Exception:
+                pass
+
+        # Remove now-unused materials that were only introduced by this import
+        for m in list(prev_mats):
+            if m is None:
+                continue
+            if m.name == "skin":
+                continue
+            try:
+                if m.users == 0:
+                    bpy.data.materials.remove(m)
+            except Exception:
+                pass
+
+    # Set armature display to rest pose so the model imports in rest pose.
+    # This does not delete or modify any actions/keyframes.
+    if armature is not None:
+        try:
+            armature.data.pose_position = "REST"
+        except Exception:
+            pass
+
+    # Apply single-material policy to imported mesh objects
+    _vs_postprocess_single_skin([o for o in all_objects if isinstance(getattr(o, "data", None), bpy.types.Mesh)])
+
+    # Sync datablock names after the import has finished creating/linking objects
+    _vs_sync_object_data_names(all_objects + ([armature] if armature is not None else []))
+
     # select newly imported objects
     for obj in bpy.context.selected_objects:
         obj.select_set(False)

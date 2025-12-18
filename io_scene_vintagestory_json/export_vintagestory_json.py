@@ -4,6 +4,7 @@ from mathutils import Vector, Euler, Quaternion, Matrix
 from dataclasses import dataclass
 import math
 import numpy as np
+import bmesh
 import posixpath # need "/" separator
 import os
 import json
@@ -570,176 +571,282 @@ def generate_mesh_element(
         "up": {"texture": "#0", "uv": [0, 0, 4, 4], "autoUv": False},
         "down": {"texture": "#0", "uv": [0, 0, 4, 4], "autoUv": False},
     }
+
+    # Robust UV access for Blender 4.x+.
+    # In Blender 4.x/4.5, UVs may be backed by mesh.attributes (CORNER/FLOAT2)
+    # and mesh.uv_layers.active.data can sometimes be empty (len==0).
+    uv_layer = None               # classic UVLoop data (preferred)
+    uv_attr = None                # mesh.attributes fallback
+    bm = None                     # last-resort fallback
+    bm_uv = None
+    bm_faces_by_poly_index = None
+    uv_name = None
+
+    if export_uvs:
+        # 1) Try classic uv_layers.active.data
+        try:
+            uvl = mesh.uv_layers.active
+            if uvl is not None:
+                uv_name = uvl.name
+                if uvl.data is not None and len(uvl.data) == len(mesh.loops):
+                    uv_layer = uvl.data
+        except Exception:
+            uv_layer = None
+
+        # 2) Try attributes-based UVs (Blender 4.x)
+        if uv_layer is None:
+            try:
+                if uv_name is None and getattr(mesh, "uv_layers", None) and mesh.uv_layers.active is not None:
+                    uv_name = mesh.uv_layers.active.name
+                attr = mesh.attributes.get(uv_name) if uv_name else None
+                if attr is not None and getattr(attr, "domain", None) == 'CORNER' and len(attr.data) == len(mesh.loops):
+                    uv_attr = attr
+            except Exception:
+                uv_attr = None
+
+        # 3) Last resort: bmesh loop UV layer
+        if uv_layer is None and uv_attr is None:
+            try:
+                bm = bmesh.new()
+                bm.from_mesh(mesh)
+                bm.faces.ensure_lookup_table()
+                bm_uv = bm.loops.layers.uv.active
+                if bm_uv is None:
+                    export_uvs = False
+                    bm.free()
+                    bm = None
+                    bm_uv = None
+                else:
+                    # Keep a direct index lookup only if face counts match.
+                    if len(bm.faces) == len(mesh.polygons):
+                        bm_faces_by_poly_index = bm.faces
+            except Exception:
+                export_uvs = False
+                if bm is not None:
+                    bm.free()
+                bm = None
+                bm_uv = None
+                bm_faces_by_poly_index = None
+
+
     
-    uv_layer = mesh.uv_layers.active.data
+    # Group polygons by direction so triangulated or subdivided cube faces
+    # still export correctly. (Some Blender ops keep 8 verts but increase poly count.)
+    dir_polys = {k: [] for k in faces.keys()}
 
-    for i, face in enumerate(mesh.polygons):
-        if i > 5: # should be 6 faces only
-            print(f"WARNING: {obj} has >6 faces")
-            break
-
-        # stack + reshape to (6,3)
-        face_normal = np.array(face.normal)
-        face_normal_stacked = np.transpose(face_normal[..., np.newaxis], (1,0))
-        face_normal_stacked = np.tile(face_normal_stacked, (6,1))
-
-        # get face direction string
+    for poly in mesh.polygons:
+        face_normal = np.array(poly.normal)
+        face_normal_stacked = np.tile(face_normal, (6, 1))
         face_direction_index = np.argmax(np.sum(face_normal_stacked * DIRECTION_NORMALS, axis=1), axis=0)
         d = DIRECTIONS[face_direction_index]
-        
+        if d in dir_polys:
+            dir_polys[d].append(poly.index)
+
+    def _corner_index(x, y, minx, maxx, miny, maxy, eps=1e-6):
+        # 0=bottom-left, 1=bottom-right, 2=top-right, 3=top-left
+        # Use distance-to-extremes instead of strict comparisons to avoid float jitter.
+        left = abs(x - minx) <= abs(x - maxx) + eps
+        bottom = abs(y - miny) <= abs(y - maxy) + eps
+        if bottom and left:
+            return 0
+        if bottom and not left:
+            return 1
+        if (not bottom) and (not left):
+            return 2
+        return 3
+
+    def _project_vert_2d(v, face_normal):
+        # v is a length-3 numpy-like (x,y,z). Returns (px,py) in the face plane.
+        if face_normal[0] > 0.5:      # normal = (1, 0, 0)
+            return (v[1], v[2])
+        if face_normal[0] < -0.5:     # normal = (-1, 0, 0)
+            return (-v[1], v[2])
+        if face_normal[1] > 0.5:      # normal = (0, 1, 0)
+            return (-v[0], v[2])
+        if face_normal[1] < -0.5:     # normal = (0, -1, 0)
+            return (v[0], v[2])
+        if face_normal[2] > 0.5:      # normal = (0, 0, 1)
+            return (v[1], -v[0])
+        # face_normal[2] < -0.5       # normal = (0, 0, -1)
+        return (v[1], v[0])
+
+    for d, poly_indices in dir_polys.items():
+        if not poly_indices:
+            continue
+
+        # Representative polygon: largest area for stable winding/loop start.
+        rep_poly = max((mesh.polygons[i] for i in poly_indices), key=lambda p: p.area)
+        rep_normal = np.array(rep_poly.normal)
+
         face_material = FaceMaterial.from_face(
             obj,
-            face.material_index,
+            rep_poly.material_index,
         )
-        
+
         # disabled face
         if face_material.type == FaceMaterial.DISABLE:
             faces[d]["texture"] = "#" + face_material.name
             faces[d]["enabled"] = False
+            continue
         # solid color tuple
-        elif face_material.type == FaceMaterial.COLOR and export_generated_texture:
-            faces[d] = face_material # replace face with face material, will convert later
+        if face_material.type == FaceMaterial.COLOR and export_generated_texture:
+            faces[d] = face_material  # replace face with face material, will convert later
             if model_colors is not None:
                 model_colors.add(face_material.color)
+            continue
         # texture
-        elif face_material.type == FaceMaterial.TEXTURE:
-            faces[d]["texture"] = "#" + face_material.name
-            model_textures[face_material.name] = face_material
+        if face_material.type != FaceMaterial.TEXTURE:
+            continue
 
-            # face glow
-            if face_material.glow > 0:
-                faces[d]["glow"] = face_material.glow
+        faces[d]["texture"] = "#" + face_material.name
+        model_textures[face_material.name] = face_material
 
-            tex_width = face_material.texture_size[0] if texture_size_x_override is None else texture_size_x_override
-            tex_height = face_material.texture_size[1] if texture_size_y_override is None else texture_size_y_override
+        # face glow
+        if face_material.glow > 0:
+            faces[d]["glow"] = face_material.glow
 
-            if export_uvs:
-                # uv loop
-                loop_start = face.loop_start
-                face_uv_0 = uv_layer[loop_start].uv
-                face_uv_1 = uv_layer[loop_start+1].uv
-                face_uv_2 = uv_layer[loop_start+2].uv
-                face_uv_3 = uv_layer[loop_start+3].uv
+        tex_width = face_material.texture_size[0] if texture_size_x_override is None else texture_size_x_override
+        tex_height = face_material.texture_size[1] if texture_size_y_override is None else texture_size_y_override
 
-                uv_min_x = min(face_uv_0[0], face_uv_2[0])
-                uv_max_x = max(face_uv_0[0], face_uv_2[0])
-                uv_min_y = min(face_uv_0[1], face_uv_2[1])
-                uv_max_y = max(face_uv_0[1], face_uv_2[1])
+        if not export_uvs:
+            continue
 
-                uv_clockwise = loop_is_clockwise([face_uv_0, face_uv_1, face_uv_2, face_uv_3])
+        # Collect UV + projected-vert samples across all polys in this direction to get a robust bbox.
+        uv_samples = []
+        vert2d_samples = []
 
-                # vertices loops
-                # project 3d vertex loop onto 2d loop based on face normal,
-                # minecraft uv mapping starting corner experimentally determined
-                verts = [ v_local[:,v] for v in face.vertices ]
-                
-                if face_normal[0] > 0.5: # normal = (1, 0, 0)
-                    verts = [ (v[1], v[2]) for v in verts ]
-                elif face_normal[0] < -0.5: # normal = (-1, 0, 0)
-                    verts = [ (-v[1], v[2]) for v in verts ]
-                elif face_normal[1] > 0.5: # normal = (0, 1, 0)
-                    verts = [ (-v[0], v[2]) for v in verts ]
-                elif face_normal[1] < -0.5: # normal = (0, -1, 0)
-                    verts = [ (v[0], v[2]) for v in verts ]
-                elif face_normal[2] > 0.5: # normal = (0, 0, 1)
-                    verts = [ (v[1], -v [0]) for v in verts ]
-                elif face_normal[2] < -0.5: # normal = (0, 0, -1)
-                    verts = [ (v[1], v[0]) for v in verts ]
-                
-                vert_min_x = min(verts[0][0], verts[2][0])
-                vert_max_x = max(verts[0][0], verts[2][0])
-                vert_min_y = min(verts[0][1], verts[2][1])
-                vert_max_y = max(verts[0][1], verts[2][1])
+        # Also collect loop sequence for the representative poly (for rotation inference).
+        rep_uvs = []
+        rep_verts2d = []
 
-                vert_clockwise = loop_is_clockwise(verts)
-                
-                # get uv, vert loop starting corner index 0..3 in face loop
+        for pi in poly_indices:
+            poly = mesh.polygons[pi]
+            loop_start = poly.loop_start
+            loop_total = poly.loop_total
 
-                # uv start corner index
-                uv_start_x = face_uv_0[0]
-                uv_start_y = face_uv_0[1]
-                if uv_start_y < uv_max_y:
-                    # start coord 0
-                    if uv_start_x < uv_max_x:
-                        uv_loop_start_index = 0
-                    # start coord 1
+            # bmesh face (only if we constructed bm and uv layer exists there)
+            bm_face = None
+            if bm_faces_by_poly_index is not None and bm_uv is not None:
+                try:
+                    bm_face = bm_faces_by_poly_index[pi]
+                except Exception:
+                    bm_face = None
+
+            for li in range(loop_total):
+                # UV (prefer uv_layers, then attributes, then bmesh)
+                if uv_layer is not None:
+                    luv = uv_layer[loop_start + li].uv
+                    u, v = float(luv[0]), float(luv[1])
+                elif uv_attr is not None:
+                    a = uv_attr.data[loop_start + li]
+                    # Blender attribute API varies: try vector/uv/value
+                    if hasattr(a, "vector"):
+                        luv = a.vector
+                    elif hasattr(a, "uv"):
+                        luv = a.uv
                     else:
-                        uv_loop_start_index = 1
+                        luv = a.value
+                    u, v = float(luv[0]), float(luv[1])
+                elif bm_face is not None:
+                    luv = bm_face.loops[li][bm_uv].uv
+                    u, v = float(luv[0]), float(luv[1])
                 else:
-                    # start coord 2
-                    if uv_start_x > uv_min_x:
-                        uv_loop_start_index = 2
-                    # start coord 3
-                    else:
-                        uv_loop_start_index = 3
-                
-                # vert start corner index
-                vert_start_x = verts[0][0]
-                vert_start_y = verts[0][1]
-                if vert_start_y < vert_max_y:
-                    # start coord 0
-                    if vert_start_x < vert_max_x:
-                        vert_loop_start_index = 0
-                    # start coord 1
-                    else:
-                        vert_loop_start_index = 1
-                else:
-                    # start coord 2
-                    if vert_start_x > vert_min_x:
-                        vert_loop_start_index = 2
-                    # start coord 3
-                    else:
-                        vert_loop_start_index = 3
+                    # no UVs available
+                    continue
 
-                # set uv flip and rotation based on
-                # 1. clockwise vs counterclockwise loop
-                # 2. relative starting corner difference between vertex loop and uv loop
-                # NOTE: if face normals correct, vertices should always be counterclockwise...
-                face_uvs = np.zeros((4,))
+                uv_samples.append((u, v))
 
-                if uv_clockwise == False and vert_clockwise == False:
-                    face_uvs[0] = uv_min_x
-                    face_uvs[1] = uv_max_y
-                    face_uvs[2] = uv_max_x
-                    face_uvs[3] = uv_min_y
-                    face_uv_rotation = COUNTERCLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
-                elif uv_clockwise == True and vert_clockwise == False:
-                    # invert x face uvs
-                    face_uvs[0] = uv_max_x
-                    face_uvs[1] = uv_max_y
-                    face_uvs[2] = uv_min_x
-                    face_uvs[3] = uv_min_y
-                    face_uv_rotation = CLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
-                elif uv_clockwise == False and vert_clockwise == True:
-                    # invert y face uvs, case should not happen
-                    face_uvs[0] = uv_max_x
-                    face_uvs[1] = uv_max_y
-                    face_uvs[2] = uv_min_x
-                    face_uvs[3] = uv_min_y
-                    face_uv_rotation = CLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
-                else: # uv_clockwise == True and vert_clockwise == True:
-                    # case should not happen
-                    face_uvs[0] = uv_min_x
-                    face_uvs[1] = uv_max_y
-                    face_uvs[2] = uv_max_x
-                    face_uvs[3] = uv_min_y
-                    face_uv_rotation = COUNTERCLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
+                # Vertex -> 2D in face plane
+                vidx = mesh.loops[loop_start + li].vertex_index
+                v3 = v_local[:, vidx]
+                p2 = _project_vert_2d(v3, rep_normal)
+                vert2d_samples.append((float(p2[0]), float(p2[1])))
 
-                xmin = face_uvs[0] * tex_width
-                ymin = (1.0 - face_uvs[1]) * tex_height
-                xmax = face_uvs[2] * tex_width
-                ymax = (1.0 - face_uvs[3]) * tex_height
+                # Representative poly sequences
+                if pi == rep_poly.index:
+                    rep_uvs.append((u, v))
+                    rep_verts2d.append((float(p2[0]), float(p2[1])))
 
-                # wtf? down different?
-                if d == "down":
-                    xmin, xmax = xmax, xmin
-                    ymin, ymax = ymax, ymin
-                    
-                faces[d]["uv"] = [ xmin, ymin, xmax, ymax ]
-                
-                if face_uv_rotation != 0 and face_uv_rotation != 360:
-                    faces[d]["rotation"] = face_uv_rotation if face_uv_rotation >= 0 else 360 + face_uv_rotation
-    
+        if not uv_samples or not rep_uvs:
+            continue
+
+        uv_min_x = min(u for u, _ in uv_samples)
+        uv_max_x = max(u for u, _ in uv_samples)
+        uv_min_y = min(v for _, v in uv_samples)
+        uv_max_y = max(v for _, v in uv_samples)
+
+        vert_min_x = min(x for x, _ in vert2d_samples)
+        vert_max_x = max(x for x, _ in vert2d_samples)
+        vert_min_y = min(y for _, y in vert2d_samples)
+        vert_max_y = max(y for _, y in vert2d_samples)
+
+        # If representative poly isn't a quad, bbox export is still fine but
+        # rotation inference becomes unreliable. Fall back to no rotation.
+        if rep_poly.loop_total != 4 or len(rep_uvs) < 4 or len(rep_verts2d) < 4:
+            face_uvs = np.array([uv_min_x, uv_max_y, uv_max_x, uv_min_y], dtype=float)
+            face_uv_rotation = 0
+        else:
+            uv_clockwise = loop_is_clockwise(rep_uvs)
+            vert_clockwise = loop_is_clockwise(rep_verts2d)
+
+            # Determine start-corner indices using bbox corners with tolerance.
+            uv_loop_start_index = _corner_index(rep_uvs[0][0], rep_uvs[0][1], uv_min_x, uv_max_x, uv_min_y, uv_max_y)
+            vert_loop_start_index = _corner_index(rep_verts2d[0][0], rep_verts2d[0][1], vert_min_x, vert_max_x, vert_min_y, vert_max_y)
+
+            face_uvs = np.zeros((4,), dtype=float)
+
+            if (not uv_clockwise) and (not vert_clockwise):
+                # TL-BR rectangle in UV space (y handled later)
+                face_uvs[0] = uv_min_x
+                face_uvs[1] = uv_max_y
+                face_uvs[2] = uv_max_x
+                face_uvs[3] = uv_min_y
+                face_uv_rotation = COUNTERCLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
+            elif uv_clockwise and (not vert_clockwise):
+                # mirrored in U, then rotate
+                face_uvs[0] = uv_max_x
+                face_uvs[1] = uv_max_y
+                face_uvs[2] = uv_min_x
+                face_uvs[3] = uv_min_y
+                face_uv_rotation = CLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
+            elif (not uv_clockwise) and vert_clockwise:
+                # rare, but keep consistent with previous fallback behavior
+                face_uvs[0] = uv_max_x
+                face_uvs[1] = uv_max_y
+                face_uvs[2] = uv_min_x
+                face_uvs[3] = uv_min_y
+                face_uv_rotation = CLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
+            else:
+                face_uvs[0] = uv_min_x
+                face_uvs[1] = uv_max_y
+                face_uvs[2] = uv_max_x
+                face_uvs[3] = uv_min_y
+                face_uv_rotation = COUNTERCLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
+
+        xmin = face_uvs[0] * tex_width
+        ymin = (1.0 - face_uvs[1]) * tex_height
+        xmax = face_uvs[2] * tex_width
+        ymax = (1.0 - face_uvs[3]) * tex_height
+
+        # "down" orientation quirk preserved from original exporter
+        if d == "down":
+            xmin, xmax = xmax, xmin
+            ymin, ymax = ymax, ymin
+
+        faces[d]["uv"] = [xmin, ymin, xmax, ymax]
+
+        if face_uv_rotation != 0 and face_uv_rotation != 360:
+            faces[d]["rotation"] = face_uv_rotation if face_uv_rotation >= 0 else 360 + face_uv_rotation
+
+
+    # free bmesh if we used it for UV reads
+    if bm is not None:
+        try:
+            bm.free()
+        except Exception:
+            pass
+
+
     # ================================
     # build children
     # ================================
@@ -782,8 +889,9 @@ def generate_mesh_element(
             if parent_bone_name != "" and parent_bone_name in bone_hierarchy and parent_bone_name in armature.data.bones:
                 # if this is main bone, parent other objects to this
                 if bone_hierarchy[parent_bone_name].main.name == obj.name:
-                    # rename this object to the bone name
-                    obj_name = parent_bone_name
+                    # Keep exported element names based on the current object name.
+                    # Bone names are used internally for hierarchy and animation sampling;
+                    # we map them to export names separately during export.
 
                     # parent other objects in same bone to this object
                     if len(bone_hierarchy[parent_bone_name].children) > 1:
@@ -825,12 +933,30 @@ def generate_mesh_element(
     # ================================
     # build element
     # ================================
+    # ------------------------------------------------
+    # Choose the name to write into VS JSON.
+    #
+    # Importer stores the original VS name in obj["vs_name"] to preserve whitespace,
+    # but we must respect user renames in Blender.
+    #
+    # Priority:
+    #   1) obj["rename"] override (explicit)
+    #   2) if user did NOT rename since import: use original VS name (obj["vs_name"]) to preserve whitespace
+    #   3) otherwise: use current Blender object name (obj_name)
+    # ------------------------------------------------
     export_name = obj_name
-    # Preserve original Vintage Story node name if present (Blender may normalize whitespace)
-    if "vs_name" in obj and isinstance(obj["vs_name"], str):
-        export_name = obj["vs_name"]
-    if "rename" in obj and isinstance(obj["rename"], str):
+
+    # Explicit override
+    if "rename" in obj and isinstance(obj["rename"], str) and obj["rename"].strip():
         export_name = obj["rename"]
+    else:
+        vs_name = obj.get("vs_name") if hasattr(obj, "get") else None
+        import_blender_name = obj.get("vs_import_blender_name") if hasattr(obj, "get") else None
+        try:
+            if isinstance(vs_name, str) and isinstance(import_blender_name, str) and obj.name == import_blender_name:
+                export_name = vs_name
+        except Exception:
+            pass
     
     new_element = {
         "name": export_name,
@@ -1298,13 +1424,28 @@ def save_all_animations(
         return m.group(1) if m else None
 
     def bone_export_name(bone):
-        # Prefer stored VS name if present; otherwise use bone name
+        """Resolve the name to emit for animation tracks.
+
+        Priority:
+        1) bone["vs_export_name"] if present (set during model export to follow user renames)
+        2) original VS name (bone["vs_name"]) only if the bone hasn't been renamed since import
+        3) current Blender bone.name
+        """
         try:
-            v = bone.get("vs_name", "")
+            v = bone.get("vs_export_name", "")
             if isinstance(v, str) and v.strip():
                 return v
         except Exception:
             pass
+
+        try:
+            vs_name = bone.get("vs_name", "")
+            imp = bone.get("vs_import_blender_name", "")
+            if isinstance(vs_name, str) and vs_name.strip() and isinstance(imp, str) and imp and bone.name == imp:
+                return vs_name
+        except Exception:
+            pass
+
         return bone.name
 
     try:
@@ -1868,8 +2009,34 @@ def save_objects(
         - message_type: set of message types, e.g. {"WARNING"} or {"INFO"}
         - message: string message, for use in `op.report(type, message)`.
     """
+    # Sync datablock names to object names right before export (helps VS JSON / VSMC and avoids stale Cube.### names)
+    try:
+        import bpy
+        for _o in bpy.data.objects:
+            try:
+                if getattr(_o, "data", None) is not None and getattr(_o.data, "users", 0) == 1:
+                    _o.data.name = _o.name
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     if filepath == "" or filepath is None:
         return {"CANCELLED"}, {"ERROR"}, "No output file path specified"
+
+    # ------------------------------------------------------------
+    # Pre-export cleanup/sync
+    # - Ensure datablock names match object names (fixes Cube.### leftovers)
+    # - Must run as late as possible, right before we read scene data
+    # ------------------------------------------------------------
+    try:
+        import bpy
+        for obj in bpy.data.objects:
+            data = getattr(obj, "data", None)
+            if data is not None and getattr(data, "users", 0) == 1:
+                data.name = obj.name
+    except Exception:
+        pass
 
     # Vintage Story JSON does not support exporting Blender armatures/bones as model elements.
     # Bones are an authoring rig only; we always export the VS element hierarchy.
@@ -1880,11 +2047,32 @@ def save_objects(
     # export status, may be modified by function if errors occur
     status = {"INFO"}
 
+    # Resolve texture size for UV export.
+    # Prefer explicit overrides, otherwise use the size declared in the imported VS JSON (stored on the scene),
+    # and finally fall back to 16.
+    scn = bpy.context.scene
+    declared_w = scn.get("vs_textureWidth", None)
+    declared_h = scn.get("vs_textureHeight", None)
+
+    # Only force overrides if we have declared sizes and the user didn't explicitly override.
+    if texture_size_x_override is None and declared_w is not None:
+        try:
+            texture_size_x_override = float(declared_w)
+        except Exception:
+            pass
+    if texture_size_y_override is None and declared_h is not None:
+        try:
+            texture_size_y_override = float(declared_h)
+        except Exception:
+            pass
+
+    tex_w_header = 16 if texture_size_x_override is None else texture_size_x_override
+    tex_h_header = 16 if texture_size_y_override is None else texture_size_y_override
+
     # output json model stub
     model_json = {
-        # default texture sizes, will be overridden
-        "textureWidth": 16 if texture_size_x_override is None else texture_size_x_override,
-        "textureHeight": 16 if texture_size_y_override is None else texture_size_y_override,
+        "textureWidth": int(tex_w_header) if abs(tex_w_header - int(tex_w_header)) < 1e-6 else tex_w_header,
+        "textureHeight": int(tex_h_header) if abs(tex_h_header - int(tex_h_header)) < 1e-6 else tex_h_header,
         "textures": {},
         "textureSizes": {},
     }
@@ -2010,6 +2198,46 @@ def save_objects(
             for bone in root_bones:
                 export_objects.append(bone_hierarchy[bone.name].main)
     
+    # ---------------------------------------------------------------------
+    # Bone -> export-name mapping
+    #
+    # Imported VS models use bones for animation authoring, but VS JSON tracks
+    # animate named nodes. If the user renames cubes/objects in the Outliner,
+    # we want both the exported *elements* and exported *animations* to use the
+    # new names.
+    #
+    # We do this by writing a transient custom property on data bones:
+    #     bone["vs_export_name"]
+    # Animation export will prefer this value.
+    # ---------------------------------------------------------------------
+    if armature is not None and bone_hierarchy is not None:
+        def _vs_object_export_name(o):
+            try:
+                if "rename" in o and isinstance(o["rename"], str) and o["rename"].strip():
+                    return o["rename"]
+            except Exception:
+                pass
+            try:
+                vs_name = o.get("vs_name") if hasattr(o, "get") else None
+                imp = o.get("vs_import_blender_name") if hasattr(o, "get") else None
+                if isinstance(vs_name, str) and isinstance(imp, str) and o.name == imp:
+                    return vs_name
+            except Exception:
+                pass
+            return getattr(o, "name", "") or ""
+
+        for bname, bnode in getattr(bone_hierarchy, "items", lambda: [])():
+            try:
+                bone = armature.data.bones.get(bname)
+                if bone is None:
+                    continue
+                main_obj = getattr(bnode, "main", None)
+                if main_obj is None:
+                    continue
+                bone["vs_export_name"] = _vs_object_export_name(main_obj)
+            except Exception:
+                pass
+
     # =========================================================================
     # export by armature
     # =========================================================================
@@ -2081,10 +2309,18 @@ def save_objects(
         def _export_name(o):
             if o is None:
                 return ""
-            if "rename" in o and isinstance(o["rename"], str):
-                return o["rename"]
-            if "vs_name" in o and isinstance(o["vs_name"], str):
-                return o["vs_name"]
+            try:
+                if "rename" in o and isinstance(o["rename"], str) and o["rename"].strip():
+                    return o["rename"]
+            except Exception:
+                pass
+            try:
+                vs_name = o.get("vs_name") if hasattr(o, "get") else None
+                imp = o.get("vs_import_blender_name") if hasattr(o, "get") else None
+                if isinstance(vs_name, str) and vs_name.strip() and isinstance(imp, str) and imp and o.name == imp:
+                    return vs_name
+            except Exception:
+                pass
             return o.name
 
         def _is_elem(o):
@@ -2105,8 +2341,42 @@ def save_objects(
 
         name_to_obj = {}
         for o in elem_objs:
-            name_to_obj[_export_name(o)] = o
-            name_to_obj[_export_name(o).strip()] = o
+            # Map multiple aliases so VS hierarchy links keep working even after renames.
+            # - current Blender name
+            # - original VS name (vs_name)
+            # - Blender name at import time (vs_import_blender_name)
+            # - explicit override (rename)
+            keys = []
+
+            try:
+                keys.append(o.name)
+            except Exception:
+                pass
+
+            try:
+                if hasattr(o, "get"):
+                    vsn = o.get("vs_name")
+                    if isinstance(vsn, str) and vsn:
+                        keys.append(vsn)
+                    impn = o.get("vs_import_blender_name")
+                    if isinstance(impn, str) and impn:
+                        keys.append(impn)
+                    rn = o.get("rename")
+                    if isinstance(rn, str) and rn:
+                        keys.append(rn)
+            except Exception:
+                pass
+
+            # export name (handles whitespace preservation when unchanged)
+            try:
+                keys.append(_export_name(o))
+            except Exception:
+                pass
+
+            for k in keys:
+                if isinstance(k, str) and k:
+                    name_to_obj[k] = o
+                    name_to_obj[k.strip()] = o
 
         # parent map (VS hierarchy)
         parent_map = {}
@@ -2399,7 +2669,9 @@ def save_objects(
                     elem[param] = round_float(elem[param])
 
             for face in elem["faces"].values():
-                face["uv"] = [round_float(x) for x in face["uv"]]
+                _uv = [round_float(x) for x in face["uv"]]
+                # VSMC is happiest with integer pixel UVs when possible.
+                face["uv"] = [int(round(v)) if abs(v - round(v)) < 1e-5 else v for v in _uv]
             
             for child in elem["children"]:
                 minify_element(child)

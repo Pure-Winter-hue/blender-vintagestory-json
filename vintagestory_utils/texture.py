@@ -2,6 +2,8 @@ import math
 import numpy as np
 import logging
 import bpy
+import bmesh
+from mathutils import Vector
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +32,154 @@ IDX_Y_AXIS = 2
 IDX_Y_NEG_AXIS = 3
 IDX_Z_AXIS = 4
 IDX_Z_NEG_AXIS = 5
+
+
+def _find_view3d_region_data(context):
+    """Best-effort find a VIEW_3D RegionView3D (region_3d).
+
+    Notes:
+    - Operators invoked from the 3D View N-panel will usually have
+      context.region_data set.
+    - If invoked from elsewhere, we scan screen areas for a 3D View.
+    """
+    region_3d = getattr(context, "region_data", None)
+    if region_3d is not None and hasattr(region_3d, "view_rotation"):
+        return region_3d
+
+    win = getattr(context, "window", None)
+    screen = getattr(win, "screen", None) if win else None
+    if not screen:
+        return None
+
+    for area in screen.areas:
+        if area.type != "VIEW_3D":
+            continue
+        for space in area.spaces:
+            if space.type == "VIEW_3D" and getattr(space, "region_3d", None) is not None:
+                return space.region_3d
+    return None
+
+
+def _view_basis_world(context):
+    """Return an orthonormal view-aligned basis in world space.
+
+    Returns (x_right, y_view_dir, z_up, mat4_world_to_basis).
+
+    Convention:
+    - x_right points to the viewport's right.
+    - z_up points to the viewport's up.
+    - y_view_dir points *into the scene* (the direction the view looks).
+
+    This is chosen so that the face *facing the viewer* has normal aligned to
+    -y in this basis (matching the addon's default front face = "-y").
+    """
+    region_3d = _find_view3d_region_data(context)
+    if region_3d is None:
+        return None
+
+    # view_rotation rotates from view space into world space.
+    q = region_3d.view_rotation
+
+    x_right = (q @ Vector((1.0, 0.0, 0.0))).normalized()
+    z_up = (q @ Vector((0.0, 1.0, 0.0))).normalized()
+    y_view_dir = (q @ Vector((0.0, 0.0, -1.0))).normalized()  # forward/look dir
+
+    # Orthonormalize defensively (rare edge cases).
+    x_right = x_right.normalized()
+    z_up = (z_up - x_right * z_up.dot(x_right)).normalized()
+    # Use a right-handed basis: up × right = forward (matches Blender view dir).
+    y_view_dir = z_up.cross(x_right).normalized()
+
+    # world_to_basis is a rotation matrix with basis vectors as rows:
+    # p_basis = world_to_basis @ p_world
+    m3 = np.array([
+        [x_right.x, x_right.y, x_right.z],
+        [y_view_dir.x, y_view_dir.y, y_view_dir.z],
+        [z_up.x, z_up.y, z_up.z],
+    ], dtype=np.float64)
+    m4 = np.eye(4, dtype=np.float64)
+    m4[0:3, 0:3] = m3
+    return x_right, y_view_dir, z_up, m4
+
+
+
+def _get_active_image_size(context):
+    """Try to find an image size (w, h) for pixel-relative UV scaling."""
+    # 1) Image editor
+    try:
+        screen = context.window.screen if context and context.window else None
+        if screen:
+            for area in screen.areas:
+                if area.type == "IMAGE_EDITOR":
+                    space = area.spaces.active
+                    img = getattr(space, "image", None)
+                    if img and getattr(img, "size", None):
+                        w, h = int(img.size[0]), int(img.size[1])
+                        if w > 0 and h > 0:
+                            return w, h
+    except Exception:
+        pass
+
+    # 2) Active material image texture nodes
+    obj = getattr(context, "active_object", None)
+    if obj and getattr(obj, "type", "") == "MESH":
+        for slot in getattr(obj, "material_slots", []) or []:
+            mat = getattr(slot, "material", None)
+            if not mat or not getattr(mat, "use_nodes", False):
+                continue
+            nt = getattr(mat, "node_tree", None)
+            if not nt:
+                continue
+            for node in nt.nodes:
+                if getattr(node, "type", "") == "TEX_IMAGE":
+                    img = getattr(node, "image", None)
+                    if img and getattr(img, "size", None):
+                        w, h = int(img.size[0]), int(img.size[1])
+                        if w > 0 and h > 0:
+                            return w, h
+    return None
+
+
+def _selected_cuboid_objects(context):
+    """Return list of objects to unwrap.
+
+    Behavior:
+    - Object mode: unwrap selected objects.
+    - Edit mode (including multi-object edit): unwrap only objects whose
+      *entire* cuboid (all 6 faces) are selected. This enables unwrapping
+      body vs legs separately without touching unselected cuboids.
+    """
+    mode = getattr(context, "mode", "OBJECT")
+    if mode == "OBJECT":
+        return list(getattr(bpy.context, "selected_objects", []) or [])
+
+    if mode != "EDIT_MESH":
+        # Fallback: behave like object mode selection.
+        return list(getattr(bpy.context, "selected_objects", []) or [])
+
+    objs = []
+    edit_objs = list(getattr(context, "objects_in_mode", []) or [])
+    if not edit_objs and getattr(context, "edit_object", None) is not None:
+        edit_objs = [context.edit_object]
+
+    for obj in edit_objs:
+        mesh = getattr(obj, "data", None)
+        if not isinstance(mesh, bpy.types.Mesh):
+            continue
+        if len(mesh.vertices) != 8 or len(mesh.polygons) != 6:
+            continue
+
+        try:
+            bm = bmesh.from_edit_mesh(mesh)
+        except Exception:
+            continue
+
+        total_faces = len(bm.faces)
+        selected_faces = sum(1 for f in bm.faces if f.select)
+        if total_faces == 6 and selected_faces == 6:
+            objs.append(obj)
+
+    return objs
 
 
 # transform/projection for cuboid faces along each axis into an XY plane
@@ -193,6 +343,651 @@ def index_of_vmin(
         return idx_min_x
     else:
         return idx_2nd_min_x
+
+
+def _unwrap_cuboid_objects(
+    *,
+    context,
+    objects,
+    front_face: str,
+    use_local_space_normals: bool,
+    scale_to_unit: bool,
+    world_to_basis_4x4: np.ndarray | None = None,
+):
+    """Core cuboid UV unwrap implementation.
+
+    If world_to_basis_4x4 is provided, all world-space vertex coordinates and
+    normals are additionally rotated into that basis before face classification
+    and projection. This enables a "project from view"-style unwrap while still
+    using the addon's VS-style cuboid layout.
+    """
+
+    # map `front_face` string arg to integer axis index
+    if front_face == "+x":
+        front_axis = X_AXIS
+        mat_front_face_to_xy = MAT_X_AX_TO_XY
+        mat_back_face_to_xy = MAT_X_NEG_AX_TO_XY
+        mat_left_face_to_xy = MAT_Y_NEG_AX_TO_XY
+        mat_right_face_to_xy = MAT_Y_AX_TO_XY
+        mat_up_face_to_xy = MAT_Z_AX_ROT270_TO_XY
+        mat_down_face_to_xy = MAT_Z_NEG_AX_ROT90_TO_XY
+    elif front_face == "-x":
+        front_axis = X_NEG_AXIS
+        mat_front_face_to_xy = MAT_X_NEG_AX_TO_XY
+        mat_back_face_to_xy = MAT_X_AX_TO_XY
+        mat_left_face_to_xy = MAT_Y_AX_TO_XY
+        mat_right_face_to_xy = MAT_Y_NEG_AX_TO_XY
+        mat_up_face_to_xy = MAT_Z_AX_ROT90_TO_XY
+        mat_down_face_to_xy = MAT_Z_NEG_AX_ROT270_TO_XY
+    elif front_face == "+y":
+        front_axis = Y_AXIS
+        mat_front_face_to_xy = MAT_Y_AX_TO_XY
+        mat_back_face_to_xy = MAT_Y_NEG_AX_TO_XY
+        mat_left_face_to_xy = MAT_X_AX_TO_XY
+        mat_right_face_to_xy = MAT_X_NEG_AX_TO_XY
+        mat_up_face_to_xy = MAT_Z_AX_ROT180_TO_XY
+        mat_down_face_to_xy = MAT_Z_NEG_AX_ROT180_TO_XY
+    elif front_face == "-y":
+        front_axis = Y_NEG_AXIS
+        mat_front_face_to_xy = MAT_Y_NEG_AX_TO_XY
+        mat_back_face_to_xy = MAT_Y_AX_TO_XY
+        mat_left_face_to_xy = MAT_X_NEG_AX_TO_XY
+        mat_right_face_to_xy = MAT_X_AX_TO_XY
+        mat_up_face_to_xy = MAT_Z_AX_TO_XY
+        mat_down_face_to_xy = MAT_Z_NEG_AX_TO_XY
+    # z-axis are different: depends on if we want aligned to y- or x-axis,
+    # matrices here are hard-coded since the rotations do not follow an
+    # easy pattern for re-use
+    elif front_face == "+z,-x":
+        front_axis = Z_AXIS
+        mat_front_face_to_xy = MAT_Z_AX_ROT270_TO_XY
+        mat_back_face_to_xy = MAT_Z_NEG_AX_ROT270_TO_XY
+        mat_left_face_to_xy = np.array([
+            [0.0, 0.0, 1.0], # x <- z
+            [-1.0, 0.0, 0.0], # y <- -x
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_right_face_to_xy = np.array([
+            [0.0, 0.0, -1.0], # x <- -z
+            [-1.0, 0.0, 0.0], # y <- -x
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_up_face_to_xy = np.array([
+            [0.0, 1.0, 0.0], # x <- y
+            [0.0, 0.0, -1.0], # y <- -z
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_down_face_to_xy = np.array([
+            [0.0, 1.0, 0.0], # x <- y
+            [0.0, 0.0, 1.0], # y <- z
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+    elif front_face == "-z,+x":
+        front_axis = Z_NEG_AXIS
+        mat_front_face_to_xy = MAT_Z_NEG_AX_ROT90_TO_XY
+        mat_back_face_to_xy = MAT_Z_AX_ROT90_TO_XY
+        mat_left_face_to_xy = np.array([
+            [0.0, 0.0, -1.0], # x <- -z
+            [1.0, 0.0, 0.0], # y <- x
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_right_face_to_xy = np.array([
+            [0.0, 0.0, 1.0], # x <- z
+            [1.0, 0.0, 0.0], # y <- x
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_up_face_to_xy = np.array([
+            [0.0, 1.0, 0.0], # x <- y
+            [0.0, 0.0, 1.0], # y <- z
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_down_face_to_xy = np.array([
+            [0.0, 1.0, 0.0], # x <- y
+            [0.0, 0.0, -1.0], # y <- -z
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+    elif front_face == "+z,+y":
+        front_axis = Z_AXIS
+        mat_front_face_to_xy = MAT_Z_AX_TO_XY
+        mat_back_face_to_xy = MAT_Z_NEG_AX_ROT180_TO_XY
+        mat_left_face_to_xy = np.array([
+            [0.0, 0.0, 1.0], # x <- z
+            [0.0, 1.0, 0.0], # y <- y
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_right_face_to_xy = np.array([
+            [0.0, 0.0, -1.0], # x <- -z
+            [0.0, 1.0, 0.0], # y <- y
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_up_face_to_xy = np.array([
+            [1.0, 0.0, 0.0], # x <- x
+            [0.0, 0.0, -1.0], # y <- -z
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_down_face_to_xy = np.array([
+            [1.0, 0.0, 0.0], # x <- x
+            [0.0, 0.0, 1.0], # y <- z
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+    elif front_face == "-z,-y":
+        front_axis = Z_NEG_AXIS
+        mat_front_face_to_xy = np.array([ #  -Z axis
+            [1.0, 0.0, 0.0], # x <- x
+            [0.0, -1.0, 0.0], # y <- -y
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_back_face_to_xy = np.array([ #  +Z axis
+            [1.0, 0.0, 0.0], # x <- x
+            [0.0, 1.0, 0.0], # y <- y
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_left_face_to_xy = np.array([
+            [0.0, 0.0, -1.0], # x <- -z
+            [0.0, -1.0, 0.0], # y <- -y
+            [0.0, 0.0, 0.0],  # z <- 0
+        ])
+        mat_right_face_to_xy = np.array([
+            [0.0, 0.0, 1.0],  # x <- z
+            [0.0, -1.0, 0.0], # y <- -y
+            [0.0, 0.0, 0.0],  # z <- 0
+        ])
+        mat_up_face_to_xy = np.array([
+            [1.0, 0.0, 0.0], # x <- x
+            [0.0, 0.0, 1.0], # y <- z
+            [0.0, 0.0, 0.0], # z <- 0
+        ])
+        mat_down_face_to_xy = np.array([
+            [1.0, 0.0, 0.0],  # x <- x
+            [0.0, 0.0, -1.0], # y <- -z
+            [0.0, 0.0, 0.0],  # z <- 0
+        ])
+    else:
+        raise Exception(
+            f"Invalid front_face: {front_face}, must be one of: +x, -x, +y, -y, +z,-x, -z,+x, +z,+y, -z,-y"
+        )
+
+    # uv face format indices
+    IDX_UV_FACE_LEFT = 0
+    IDX_UV_FACE_FRONT = 1
+    IDX_UV_FACE_RIGHT = 2
+    IDX_UV_FACE_BACK = 3
+    IDX_UV_FACE_UP = 4
+    IDX_UV_FACE_DOWN = 5
+
+    # For mapping direction indices into the LEFT-FRONT-RIGHT-BACK-UP-DOWN format.
+    # These are stable constants across front_face modes.
+    # (We keep them here to avoid relying on outer class scope.)
+
+    for obj in objects:
+        try:
+            mesh = obj.data
+            if not isinstance(mesh, bpy.types.Mesh):
+                continue
+
+            # skip non cuboid meshes, print warning
+            if len(mesh.vertices) != 8 or len(mesh.polygons) != 6:
+                log.warning(f"Skipping UV unwrap of non-cuboid mesh: {obj.name}")
+                continue
+
+            # Ensure there is an active UV map.
+            if mesh.uv_layers.active is None:
+                mesh.uv_layers.new(name="UVMap")
+            uv_layer = mesh.uv_layers.active.data
+
+            vertices_local = np.ones((4, 8))  # 8 verts, (x,y,z,1)
+            for i, v in enumerate(mesh.vertices):
+                vertices_local[0:3, i] = v.co
+
+            matrix_world = np.asarray(obj.matrix_world, dtype=np.float64)
+            vertices_world = matrix_world @ vertices_local
+
+            if world_to_basis_4x4 is not None:
+                vertices = world_to_basis_4x4 @ vertices_world
+            else:
+                vertices = vertices_world
+
+            if use_local_space_normals:
+                normal_matrix = np.identity(3)
+            else:
+                try:
+                    normal_matrix = np.transpose(np.linalg.inv(matrix_world[0:3, 0:3]))
+                except Exception:
+                    log.warning(f"Non-invertible matrix for: {obj.name}, using its world matrix instead")
+                    normal_matrix = matrix_world[0:3, 0:3]
+
+            # gather original mesh face vertices and normals
+            mesh_face_uv_loop_start = np.zeros((6,), dtype=int)  # (face,)
+            mesh_face_vert_indices = np.zeros((6, 4), dtype=int)  # (face, vert)
+            mesh_face_vertices = np.zeros((6, 4, 4), dtype=np.float64)  # (face, vert, xyzw)
+            mesh_face_normals = np.zeros((6, 3), dtype=np.float64)  # (face, xyz)
+
+            for i, face in enumerate(mesh.polygons):
+                mesh_face_uv_loop_start[i] = face.loop_start
+                mesh_face_vertices[i, :, :] = np.stack(
+                    [vertices[:, v] for v in face.vertices],
+                    axis=0,
+                )
+                mesh_face_vert_indices[i, :] = face.vertices
+                mesh_face_normals[i, :] = np.array(face.normal)
+
+            # world space face normals
+            mesh_face_normals_world = normal_matrix @ mesh_face_normals.transpose()
+            mesh_face_normals_world = mesh_face_normals_world.transpose()
+
+            if world_to_basis_4x4 is not None:
+                m3 = world_to_basis_4x4[0:3, 0:3]
+                mesh_face_normals_world = (m3 @ mesh_face_normals_world.transpose()).transpose()
+
+            # detect index of closest matching mesh front face
+            front_index = np.argmax(np.sum(mesh_face_normals_world * front_axis, axis=1), axis=0)
+
+            # Determine which faces are adjacent to the front face.
+            # (This is the original addon's robust method for assigning
+            # LEFT/RIGHT/UP/DOWN/BACK in a unique way.)
+
+            # face local indices f0..f3 -> mesh vertex indices v0..v3
+            mesh_face_f0_f1_f2_f3 = np.zeros((6, 4), dtype=int)
+            mesh_face_v0_v1_v2_v3 = np.zeros((6, 4), dtype=int)
+            # direction indices for each mesh face (into LEFT/FRONT/... array)
+            mesh_face_directions = -1 * np.ones((6,), dtype=int)
+
+            # helper: compute face projected coords for determining vmin
+            def _project_face_xy(face_idx: int, mat_to_xy: np.ndarray):
+                return mat_to_xy @ mesh_face_vertices[face_idx, :, :3].transpose()
+
+            # mark front face
+            mesh_face_directions[front_index] = IDX_UV_FACE_FRONT
+
+            # compute v0-v3 ordering for each face based on its "look" matrix
+            for i in range(0, 6):
+                if i == front_index:
+                    face_verts_xy = _project_face_xy(i, mat_front_face_to_xy)
+                else:
+                    # pick the matrix by the face normal direction later
+                    # (we will overwrite below once direction is known)
+                    face_verts_xy = _project_face_xy(i, mat_front_face_to_xy)
+
+                f0 = index_of_vmin(face_verts_xy.transpose())
+                is_cw = loop_is_clockwise(face_verts_xy[0:3, 0:3].transpose())
+                if is_cw:
+                    f3 = (f0 + 1) % 4
+                    f2 = (f0 + 2) % 4
+                    f1 = (f0 + 3) % 4
+                else:
+                    f1 = (f0 + 1) % 4
+                    f2 = (f0 + 2) % 4
+                    f3 = (f0 + 3) % 4
+
+                v0 = mesh_face_vert_indices[i, f0]
+                v1 = mesh_face_vert_indices[i, f1]
+                v2 = mesh_face_vert_indices[i, f2]
+                v3 = mesh_face_vert_indices[i, f3]
+                mesh_face_f0_f1_f2_f3[i, :] = [f0, f1, f2, f3]
+                mesh_face_v0_v1_v2_v3[i, :] = [v0, v1, v2, v3]
+
+            # Use vertex adjacency against the front face's ordered verts.
+            # Identify left/right/up/down.
+            f_front_v0, f_front_v1, f_front_v2, f_front_v3 = mesh_face_v0_v1_v2_v3[front_index, :]
+
+            def _face_has_verts(face_idx: int, a: int, b: int) -> bool:
+                vv = set(mesh_face_vert_indices[face_idx, :].tolist())
+                return (a in vv) and (b in vv)
+
+            # Find faces adjacent to front via the shared edges.
+            for i in range(0, 6):
+                if i == front_index:
+                    continue
+                if mesh_face_directions[i] != -1:
+                    continue
+
+                if _face_has_verts(i, f_front_v0, f_front_v3):
+                    mesh_face_directions[i] = IDX_UV_FACE_LEFT
+                elif _face_has_verts(i, f_front_v1, f_front_v2):
+                    mesh_face_directions[i] = IDX_UV_FACE_RIGHT
+                elif _face_has_verts(i, f_front_v2, f_front_v3):
+                    mesh_face_directions[i] = IDX_UV_FACE_UP
+                elif _face_has_verts(i, f_front_v0, f_front_v1):
+                    mesh_face_directions[i] = IDX_UV_FACE_DOWN
+
+            # Remaining unassigned face is the back.
+            back_candidates = [i for i in range(0, 6) if mesh_face_directions[i] == -1]
+            if len(back_candidates) != 1:
+                raise Exception(
+                    "Invalid cuboid mesh: could not uniquely determine back face from adjacency"
+                )
+            mesh_face_directions[back_candidates[0]] = IDX_UV_FACE_BACK
+
+            # Now we have per-face directions. Fix the v0..v3 ordering for each
+            # face using the correct projection matrix for that direction.
+            for i in range(0, 6):
+                direction_index = mesh_face_directions[i]
+                if direction_index == IDX_UV_FACE_LEFT:
+                    face_verts_xy = _project_face_xy(i, mat_left_face_to_xy)
+                elif direction_index == IDX_UV_FACE_FRONT:
+                    face_verts_xy = _project_face_xy(i, mat_front_face_to_xy)
+                elif direction_index == IDX_UV_FACE_RIGHT:
+                    face_verts_xy = _project_face_xy(i, mat_right_face_to_xy)
+                elif direction_index == IDX_UV_FACE_BACK:
+                    face_verts_xy = _project_face_xy(i, mat_back_face_to_xy)
+                elif direction_index == IDX_UV_FACE_UP:
+                    face_verts_xy = _project_face_xy(i, mat_up_face_to_xy)
+                elif direction_index == IDX_UV_FACE_DOWN:
+                    face_verts_xy = _project_face_xy(i, mat_down_face_to_xy)
+                else:
+                    raise Exception("Invalid face direction assignment")
+
+                f0 = index_of_vmin(face_verts_xy.transpose())
+                is_cw = loop_is_clockwise(face_verts_xy[0:3, 0:3].transpose())
+                if is_cw:
+                    f3 = (f0 + 1) % 4
+                    f2 = (f0 + 2) % 4
+                    f1 = (f0 + 3) % 4
+                else:
+                    f1 = (f0 + 1) % 4
+                    f2 = (f0 + 2) % 4
+                    f3 = (f0 + 3) % 4
+
+                v0 = mesh_face_vert_indices[i, f0]
+                v1 = mesh_face_vert_indices[i, f1]
+                v2 = mesh_face_vert_indices[i, f2]
+                v3 = mesh_face_vert_indices[i, f3]
+                mesh_face_f0_f1_f2_f3[i, :] = [f0, f1, f2, f3]
+                mesh_face_v0_v1_v2_v3[i, :] = [v0, v1, v2, v3]
+
+            # Create uvs based on face width/height and place them in
+            # LEFT-FRONT-RIGHT-BACK-UP-DOWN layout.
+            face_uv_width_height = np.zeros((6, 2))
+            face_uv_xy = np.zeros((6, 4, 2))
+            face_uv_loop_start = np.zeros((6,), dtype=int)
+
+            for i in range(0, 6):
+                direction_index = mesh_face_directions[i]
+                f0, f1, f2, f3 = mesh_face_f0_f1_f2_f3[i, :]
+                v0, v1, v2, v3 = mesh_face_v0_v1_v2_v3[i, :]
+
+                face_width = np.linalg.norm(vertices[:3, v0] - vertices[:3, v1])
+                face_height = np.linalg.norm(vertices[:3, v1] - vertices[:3, v2])
+
+                face_uv_width_height[direction_index, 0] = face_width
+                face_uv_width_height[direction_index, 1] = face_height
+
+                face_uv_xy[direction_index, f0, :] = (0.0, 0.0)
+                face_uv_xy[direction_index, f1, :] = (face_width, 0.0)
+                face_uv_xy[direction_index, f2, :] = (face_width, face_height)
+                face_uv_xy[direction_index, f3, :] = (0.0, face_height)
+
+                face_uv_loop_start[direction_index] = mesh_face_uv_loop_start[i]
+
+            uv_offset = np.zeros((6, 2))
+            uv_offset[IDX_UV_FACE_FRONT, :] = (face_uv_width_height[IDX_UV_FACE_LEFT, 0], 0.0)
+            uv_offset[IDX_UV_FACE_RIGHT, :] = (
+                face_uv_width_height[IDX_UV_FACE_LEFT, 0] + face_uv_width_height[IDX_UV_FACE_FRONT, 0],
+                0.0,
+            )
+            uv_offset[IDX_UV_FACE_BACK, :] = (
+                face_uv_width_height[IDX_UV_FACE_LEFT, 0]
+                + face_uv_width_height[IDX_UV_FACE_FRONT, 0]
+                + face_uv_width_height[IDX_UV_FACE_RIGHT, 0],
+                0.0,
+            )
+            uv_offset[IDX_UV_FACE_UP, :] = (
+                face_uv_width_height[IDX_UV_FACE_LEFT, 0],
+                face_uv_width_height[IDX_UV_FACE_LEFT, 1],
+            )
+            uv_offset[IDX_UV_FACE_DOWN, :] = (
+                face_uv_width_height[IDX_UV_FACE_LEFT, 0] + face_uv_width_height[IDX_UV_FACE_UP, 0],
+                face_uv_width_height[IDX_UV_FACE_LEFT, 1],
+            )
+
+            uv_xy = uv_offset[:, np.newaxis, :] + face_uv_xy
+
+            if scale_to_unit:
+                uv_scale = 1.0 / uv_xy.max(axis=(0, 1, 2))
+                uv_xy = uv_scale * uv_xy
+
+            # update face uvs
+            for i in range(0, 6):
+                idx = face_uv_loop_start[i]
+                uv_layer[idx].uv = (uv_xy[i, 0, 0], uv_xy[i, 0, 1])
+                uv_layer[idx + 1].uv = (uv_xy[i, 1, 0], uv_xy[i, 1, 1])
+                uv_layer[idx + 2].uv = (uv_xy[i, 2, 0], uv_xy[i, 2, 1])
+                uv_layer[idx + 3].uv = (uv_xy[i, 3, 0], uv_xy[i, 3, 1])
+
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            err_msg = f"Error unwrapping cuboid: {obj.name}, {e}"
+            log.error(err_msg)
+            # Prefer reporting through operator if available.
+            op = getattr(context, "active_operator", None)
+            if op is not None and hasattr(op, "report"):
+                op.report({"ERROR"}, err_msg)
+
+
+
+# =============================================================================
+# View-oriented "project from view" cuboid unwrap
+# =============================================================================
+
+def _unwrap_project_from_view_groups(*, context, objects, scale_to_unit: bool, mode: str = "AUTO", margin_px: int = 2):
+    """Project selected cuboid faces into 6 view-relative groups.
+
+    Groups (relative to the active 3D View):
+      - FRONT: faces pointing toward the viewer (normal ~ -view_dir)
+      - BACK:  faces pointing away (normal ~ +view_dir)
+      - LEFT/RIGHT: faces pointing to screen-left / screen-right
+      - UP/DOWN: faces pointing to screen-up / screen-down
+
+    Within each group, faces are projected so they appear with the same
+    orientation as they would in that corresponding orthographic view.
+
+    Finally, the 6 groups are arranged into a VS/Minecraft-style cuboid net:
+
+             [  UP  ]
+    [ LEFT ][FRONT][RIGHT][ BACK ]
+             [ DOWN ]
+    """
+    vb = _view_basis_world(context)
+    if vb is None:
+        raise RuntimeError("No active VIEW_3D region found")
+    X, Y, Z, _m4 = vb  # X=screen right, Y=into scene, Z=screen up (all in world space)
+
+    # Virtual view projection axes for each group: (screen_right, screen_up) in world space
+    proj_axes = {
+        "FRONT": (X, Z),          # looking along +Y, visible normals ~ -Y
+        "BACK": (-X, Z),          # looking along -Y (mirror X)
+        "RIGHT": (-Y, Z),         # looking along -X
+        "LEFT": (Y, Z),           # looking along +X
+        "UP": (X, -Y),            # looking along -Z
+        "DOWN": (X, Y),           # looking along +Z
+    }
+
+    # Net placement (col, row) in a 4x3 grid (row 0 = bottom)
+    net_pos = {
+        "LEFT": (0, 1),
+        "FRONT": (1, 1),
+        "RIGHT": (2, 1),
+        "BACK": (3, 1),
+        "UP": (1, 2),
+        "DOWN": (1, 0),
+    }
+
+    # Accumulate raw projections per loop so we can normalize + lay out after bounds are known.
+    # Each entry: (mesh, loop_index, group, u_raw, v_raw)
+    records = []
+    bounds = {k: [math.inf, -math.inf, math.inf, -math.inf] for k in proj_axes.keys()}  # umin, umax, vmin, vmax
+
+    def _ensure_uv(mesh):
+        if mesh.uv_layers.active is None:
+            mesh.uv_layers.new(name="UVMap")
+        return mesh.uv_layers.active.data
+
+    for obj in objects:
+        if obj is None or obj.type != "MESH":
+            continue
+        mesh = obj.data
+        if mesh is None:
+            continue
+
+        uv_data = _ensure_uv(mesh)
+
+        mw = obj.matrix_world
+        mwn = mw.to_3x3()
+
+        # Heuristic: treat as cuboid-like only if it has at least 6 faces.
+        # We still categorize faces individually (doesn't assume perfect boxes).
+        for face in mesh.polygons:
+            # World-space normal
+            n_world = (mwn @ face.normal).normalized()
+            # Components in view basis
+            nx = n_world.dot(X)
+            ny = n_world.dot(Y)
+            nz = n_world.dot(Z)
+
+            ax = abs(nx); ay = abs(ny); az = abs(nz)
+            if ay >= ax and ay >= az:
+                group = "FRONT" if ny < 0.0 else "BACK"
+            elif ax >= ay and ax >= az:
+                group = "RIGHT" if nx > 0.0 else "LEFT"
+            else:
+                group = "UP" if nz > 0.0 else "DOWN"
+
+            xr, zu = proj_axes[group]
+
+            # Project each loop vertex into the group's virtual screen plane
+            ls = face.loop_start
+            le = ls + face.loop_total
+            for li in range(ls, le):
+                vi = mesh.loops[li].vertex_index
+                wco = mw @ mesh.vertices[vi].co
+                u = wco.dot(xr)
+                v = wco.dot(zu)
+                records.append((mesh, li, group, u, v))
+
+                b = bounds[group]
+                if u < b[0]: b[0] = u
+                if u > b[1]: b[1] = u
+                if v < b[2]: b[2] = v
+                if v > b[3]: b[3] = v
+
+    if not records:
+        return
+
+    # Compute group sizes
+    sizes = {}
+    max_dim = 0.0
+    for g, (umin, umax, vmin, vmax) in bounds.items():
+        if not math.isfinite(umin):
+            sizes[g] = (0.0, 0.0)
+            continue
+        w = max(umax - umin, 1e-9)
+        h = max(vmax - vmin, 1e-9)
+        sizes[g] = (w, h)
+        max_dim = max(max_dim, w, h)
+
+    # Cell size and padding in raw units
+    cell = max(max_dim, 1e-6)
+    pad = cell * 0.05
+
+    # Layout extents in raw units
+    total_w = 4 * cell + 5 * pad
+    total_h = 3 * cell + 4 * pad
+
+    # Determine scaling / placement strategy
+    mode_eff = mode.upper().strip() if isinstance(mode, str) else "AUTO"
+    if mode_eff == "AUTO":
+        mode_eff = "UNIT" if scale_to_unit else "RAW"
+
+    img_size = None
+    if mode_eff in {"PIXEL", "BOUNDS"}:
+        img_size = _get_active_image_size(context)
+        if img_size is None:
+            # Fallback: still produce something usable without an image
+            mode_eff = "UNIT"
+
+    scale_u = 1.0
+    scale_v = 1.0
+    off_global_u = 0.0
+    off_global_v = 0.0
+
+    if mode_eff == "UNIT":
+        s = 1.0 / max(total_w, total_h)
+        # center the net in [0,1]
+        off_global_u = (1.0 - total_w * s) * 0.5
+        off_global_v = (1.0 - total_h * s) * 0.5
+        scale_u = s
+        scale_v = s
+
+    elif mode_eff == "BOUNDS":
+        if img_size:
+            img_w, img_h = img_size
+            margin_u = float(margin_px) / float(max(img_w, 1))
+            margin_v = float(margin_px) / float(max(img_h, 1))
+        else:
+            margin_u = margin_v = 0.02
+
+        avail_w = max(1.0 - 2.0 * margin_u, 1e-6)
+        avail_h = max(1.0 - 2.0 * margin_v, 1e-6)
+        s = min(avail_w / max(total_w, 1e-9), avail_h / max(total_h, 1e-9))
+        off_global_u = margin_u + (avail_w - total_w * s) * 0.5
+        off_global_v = margin_v + (avail_h - total_h * s) * 0.5
+        scale_u = s
+        scale_v = s
+
+    elif mode_eff == "PIXEL":
+        img_w, img_h = img_size
+        scale_u = 1.0 / float(max(img_w, 1))
+        scale_v = 1.0 / float(max(img_h, 1))
+        margin_u = float(margin_px) / float(max(img_w, 1))
+        margin_v = float(margin_px) / float(max(img_h, 1))
+
+        # Place near bottom-left by default.
+        off_global_u = margin_u
+        off_global_v = margin_v
+
+        # If it wouldn't fit in the 0..1 tile, shrink uniformly (preserving proportions).
+        net_w = total_w * scale_u
+        net_h = total_h * scale_v
+        avail_w = max(1.0 - 2.0 * margin_u, 1e-6)
+        avail_h = max(1.0 - 2.0 * margin_v, 1e-6)
+        if net_w > avail_w or net_h > avail_h:
+            k = min(avail_w / max(net_w, 1e-9), avail_h / max(net_h, 1e-9))
+            scale_u *= k
+            scale_v *= k
+
+    else:  # RAW
+        scale_u = 1.0
+        scale_v = 1.0
+        off_global_u = 0.0
+        off_global_v = 0.0
+
+    # Per-group offsets (raw units), with per-group centering in its cell
+    group_offset = {}
+    for g, (col, row) in net_pos.items():
+        w, h = sizes.get(g, (0.0, 0.0))
+        # If group is empty, just place at cell origin
+        cx = (cell - w) * 0.5
+        cy = (cell - h) * 0.5
+        u0 = pad + col * (cell + pad) + max(cx, 0.0)
+        v0 = pad + row * (cell + pad) + max(cy, 0.0)
+        group_offset[g] = (u0, v0)
+
+    # Apply UVs
+    for mesh, li, g, u, v in records:
+        umin, _umax, vmin, _vmax = bounds[g]
+        u_local = (u - umin) + group_offset[g][0]
+        v_local = (v - vmin) + group_offset[g][1]
+        uv = mesh.uv_layers.active.data[li].uv
+        uv[0] = off_global_u + u_local * scale_u
+        uv[1] = off_global_v + v_local * scale_v
+
+    # Update meshes
+    for obj in objects:
+        if obj and obj.type == "MESH":
+            obj.data.update()
+
 
 class OpUVCuboidUnwrap(bpy.types.Operator):
     """Specialized VS cuboid UV unwrap"""
@@ -698,6 +1493,283 @@ class OpUVCuboidUnwrap(bpy.types.Operator):
         if need_to_switch_mode_back:
             bpy.ops.object.mode_set(mode=user_mode)
         
+        return {"FINISHED"}
+
+
+class OpUVCuboidUnwrapProjectFromView(bpy.types.Operator):
+    """VS cuboid unwrap that orients the UVs to the current 3D View.
+
+    The face most "visible" in the viewport becomes the FRONT face of the
+    unwrap layout. This makes it much easier to texture from dorsal,
+    underbelly, or side views because the UV island orientation matches what
+    you're seeing.
+
+    In edit mode, only cuboids whose *entire* 6 faces are selected are unwrapped.
+    """
+
+    bl_idname = "vintagestory.uv_cuboid_unwrap_project_from_view"
+    bl_label = "Cuboid UV Unwrap (Project From View)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    scale_to_unit: bpy.props.BoolProperty(
+        default=False,
+        name="Scale to [0, 1]",
+        description="Scale UVs to fit into [0, 1] square",
+    )
+
+    def execute(self, context):
+        vb = _view_basis_world(context)
+        if vb is None:
+            self.report({"ERROR"}, "Could not read active 3D View orientation (need a VIEW_3D area).")
+            return {"CANCELLED"}
+
+        _x_right, _y_view_dir, _z_up, world_to_basis_4x4 = vb
+
+        # Determine target objects:
+        # - Object mode: selected objects
+        # - Edit mode: only cuboids with all 6 faces selected
+        objects = _selected_cuboid_objects(context)
+        if not objects:
+            self.report({"WARNING"}, "No fully-selected cuboids found to unwrap.")
+            return {"CANCELLED"}
+
+        # Need to be in object mode to write uv_layer efficiently.
+        user_mode = context.active_object.mode if context.active_object else "OBJECT"
+        need_to_switch_mode_back = user_mode != "OBJECT"
+        if need_to_switch_mode_back:
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        try:
+            # We align the view basis so that "front" is always -Y in that basis.
+            _unwrap_project_from_view_groups(
+                context=context,
+                objects=objects,
+                scale_to_unit=bool(self.scale_to_unit),
+                mode="PIXEL",
+                margin_px=int(getattr(self, "margin_px", 2)),
+            )
+        finally:
+            if need_to_switch_mode_back:
+                bpy.ops.object.mode_set(mode=user_mode)
+
+        return {"FINISHED"}
+
+
+
+class OpUVCuboidUnwrapProjectFromViewToBounds(bpy.types.Operator):
+    """View-oriented cuboid unwrap that fits the net into the 0..1 UV tile.
+
+    Same face grouping/orientation as 'Cuboid UV Unwrap (View)', but scaled and
+    centered to stay inside UV bounds (with a small margin).
+    """
+
+    bl_idname = "vintagestory.uv_cuboid_unwrap_project_from_view_to_bounds"
+    bl_label = "Cuboid UV Unwrap (View to Bounds)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    margin_px: bpy.props.IntProperty(
+        default=2,
+        min=0,
+        name="Margin (px)",
+        description="Margin in pixels to keep inside the 0..1 UV tile when an image is available",
+    )
+
+    def execute(self, context):
+        vb = _view_basis_world(context)
+        if vb is None:
+            self.report({"ERROR"}, "Could not read active 3D View orientation (need a VIEW_3D area).")
+            return {"CANCELLED"}
+
+        objects = _selected_cuboid_objects(context)
+        if not objects:
+            self.report({"WARNING"}, "No fully-selected cuboids found to unwrap.")
+            return {"CANCELLED"}
+
+        user_mode = context.active_object.mode if context.active_object else "OBJECT"
+        need_to_switch_mode_back = user_mode != "OBJECT"
+        if need_to_switch_mode_back:
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        try:
+            _unwrap_project_from_view_groups(
+                context=context,
+                objects=objects,
+                scale_to_unit=True,
+                mode="BOUNDS",
+                margin_px=int(self.margin_px),
+            )
+        finally:
+            if need_to_switch_mode_back:
+                bpy.ops.object.mode_set(mode=user_mode)
+
+        return {"FINISHED"}
+
+
+
+
+class OpUVCuboidMakeCuboidUV(bpy.types.Operator):
+    """Rectify existing UVs on selected cuboids into proper per-face rectangles.
+
+    This is meant as a "re-cuboid" step before export to tools that expect
+    cuboid-style UV rectangles (e.g. VSMC).
+
+    What it does:
+    - Ensures the mesh has an active UV map.
+    - For each of the 6 quad faces, computes the current UV bounding box.
+    - Reassigns the 4 UV corners to match a canonical, axis-aligned rectangle,
+      *rotating* the UV tile as needed so the face orientation is consistent.
+
+    It preserves the existing UV rectangle *position/size* (the bbox) so your
+    view-based grouping layout stays intact.
+
+    In edit mode, only cuboids whose entire 6 faces are selected are processed.
+    """
+
+    bl_idname = "vintagestory.uv_make_cuboid_uv"
+    bl_label = "Make Cuboid UV (Rectify)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    snap_to_pixels: bpy.props.BoolProperty(
+        default=False,
+        name="Snap to Pixels",
+        description="Snap UV rectangle bounds to the active image pixel grid (if an image is available)",
+    )
+
+    def execute(self, context):
+        objects = _selected_cuboid_objects(context)
+        if not objects:
+            self.report({"WARNING"}, "No fully-selected cuboids found.")
+            return {"CANCELLED"}
+
+        user_mode = context.active_object.mode if context.active_object else "OBJECT"
+        need_to_switch_mode_back = user_mode != "OBJECT"
+        if need_to_switch_mode_back:
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        try:
+            img_size = _get_active_image_size(context)
+            for obj in objects:
+                mesh = obj.data
+                if not isinstance(mesh, bpy.types.Mesh):
+                    continue
+                if len(mesh.vertices) != 8 or len(mesh.polygons) != 6:
+                    continue
+
+                # Ensure UV map exists and has data.
+                if mesh.uv_layers.active is None:
+                    mesh.uv_layers.new(name="UVMap")
+                # In some Blender 4.x cases, the wrapper exists but data can be empty until update.
+                try:
+                    mesh.update()
+                except Exception:
+                    pass
+                if mesh.uv_layers.active is None:
+                    continue
+
+                uv_layer = mesh.uv_layers.active.data
+                if len(uv_layer) == 0 and len(mesh.loops) > 0:
+                    # Create a fresh UV map.
+                    mesh.uv_layers.new(name="UVMap")
+                    mesh.uv_layers.active = mesh.uv_layers[-1]
+                    try:
+                        mesh.update()
+                    except Exception:
+                        pass
+                    uv_layer = mesh.uv_layers.active.data
+
+                # Fallback: if still empty, we cannot rectify.
+                if len(uv_layer) == 0:
+                    self.report({"WARNING"}, f"{obj.name}: UV map has no data; run an unwrap first.")
+                    continue
+
+                # Build quick local vertex lookup
+                v_local = [np.array(v.co, dtype=np.float64) for v in mesh.vertices]
+
+                for face in mesh.polygons:
+                    if face.loop_total != 4:
+                        continue
+
+                    ls = face.loop_start
+                    uvs = [uv_layer[ls + i].uv.copy() for i in range(4)]
+                    uv_min_x = min(u[0] for u in uvs)
+                    uv_max_x = max(u[0] for u in uvs)
+                    uv_min_y = min(u[1] for u in uvs)
+                    uv_max_y = max(u[1] for u in uvs)
+
+                    # Degenerate UVs: skip.
+                    if (uv_max_x - uv_min_x) <= 1e-12 or (uv_max_y - uv_min_y) <= 1e-12:
+                        continue
+
+                    # Optional snap to pixels
+                    if self.snap_to_pixels and img_size is not None:
+                        w, h = img_size
+                        def _snap(v, n):
+                            return round(v * n) / float(n)
+                        uv_min_x = _snap(uv_min_x, w)
+                        uv_max_x = _snap(uv_max_x, w)
+                        uv_min_y = _snap(uv_min_y, h)
+                        uv_max_y = _snap(uv_max_y, h)
+                        if uv_min_x == uv_max_x or uv_min_y == uv_max_y:
+                            continue
+
+                    # Project this face's vertices to a stable 2D space based on its normal,
+                    # matching the exporter's convention. This gives us a consistent "corner order".
+                    n = np.array(face.normal, dtype=np.float64)
+                    # Determine dominant axis
+                    ax = int(np.argmax(np.abs(n)))
+                    sign = 1.0 if n[ax] >= 0.0 else -1.0
+
+                    verts = [v_local[idx] for idx in face.vertices]
+                    verts2d = []
+                    if ax == 0:  # +/-X
+                        # +X: (y, z), -X: (-y, z)
+                        for v in verts:
+                            if sign > 0:
+                                verts2d.append((v[1], v[2]))
+                            else:
+                                verts2d.append((-v[1], v[2]))
+                    elif ax == 1:  # +/-Y
+                        # +Y: (-x, z), -Y: (x, z)
+                        for v in verts:
+                            if sign > 0:
+                                verts2d.append((-v[0], v[2]))
+                            else:
+                                verts2d.append((v[0], v[2]))
+                    else:  # +/-Z
+                        # +Z: (y, -x), -Z: (y, x)
+                        for v in verts:
+                            if sign > 0:
+                                verts2d.append((v[1], -v[0]))
+                            else:
+                                verts2d.append((v[1], v[0]))
+
+                    verts2d_np = np.array(verts2d, dtype=np.float64)
+                    f0 = index_of_vmin(verts2d_np)
+                    is_cw = loop_is_clockwise(verts2d_np)
+                    if is_cw:
+                        f3 = (f0 + 1) % 4
+                        f2 = (f0 + 2) % 4
+                        f1 = (f0 + 3) % 4
+                    else:
+                        f1 = (f0 + 1) % 4
+                        f2 = (f0 + 2) % 4
+                        f3 = (f0 + 3) % 4
+
+                    # Assign bbox corners in a canonical order.
+                    uv_for_corner = {
+                        f0: (uv_min_x, uv_min_y),
+                        f1: (uv_max_x, uv_min_y),
+                        f2: (uv_max_x, uv_max_y),
+                        f3: (uv_min_x, uv_max_y),
+                    }
+
+                    for j in range(4):
+                        uv_layer[ls + j].uv = uv_for_corner[j]
+
+        finally:
+            if need_to_switch_mode_back:
+                bpy.ops.object.mode_set(mode=user_mode)
+
         return {"FINISHED"}
 
 

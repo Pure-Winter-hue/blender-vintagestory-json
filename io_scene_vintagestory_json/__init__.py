@@ -40,29 +40,6 @@ class ImportVintageStoryJson(Operator, ImportHelper):
         default=False,
     )
 
-    # applies default shift from vintagestory origin
-    do_translate_origin: BoolProperty(
-        name="Center Back on Origin",
-        description="Shift the imported model back onto the scene origin (0,0,0)",
-        default=False,
-    )
-    
-    translate_origin_x: FloatProperty(
-        name="Translate X",
-        description="X export offset (in Blender coordinates)",
-        default=-8.,
-    )
-    translate_origin_y: FloatProperty(
-        name="Translate Y",
-        description="Y export offset (in Blender coordinates)",
-        default=-8.,
-    )
-    translate_origin_z: FloatProperty(
-        name="Translate Z",
-        description="Z export offset (in Blender coordinates)",
-        default=0.,
-    )
-
     # import animations
     import_animations: BoolProperty(
         name="Import Animations",
@@ -72,14 +49,17 @@ class ImportVintageStoryJson(Operator, ImportHelper):
 
     def execute(self, context):
         args = self.as_keywords()
-        if args["do_translate_origin"] == True:
-            args["translate_origin"] = [
-                args["translate_origin_x"],
-                args["translate_origin_y"],
-                args["translate_origin_z"],
-            ]
-        else:
-            args["translate_origin"] = None
+        # Auto-compensate the Vintage Story block-space origin.
+        # VS models are commonly authored in [0..16] space with origin at the
+        # corner of the block. For Blender work (and mirror operations) it's
+        # much nicer if the imported model is centered around the origin.
+        #
+        # This is intentionally not exposed as a user-facing option.
+        args["translate_origin"] = [-8.0, -8.0, 0.0]
+
+        # Force single-material import workflow: we strip all materials and assign a shared 'skin' material
+        # in the importer post-process, so skip texture/material import entirely.
+        args["import_textures"] = False
 
         return import_vintagestory_json.load(context, **args)
 
@@ -91,14 +71,9 @@ def run_export(
     """Common internal function to run export and handle post export script.
     Re-usable for different export operators.
     """
-    if args.get("do_translate_origin", False):
-        args["translate_origin"] = [
-            args["translate_origin_x"],
-            args["translate_origin_y"],
-            args["translate_origin_z"],
-        ]
-    else:
-        args["translate_origin"] = None
+    # Undo the import-time origin compensation so exported JSON stays in the
+    # expected VS coordinate space. Intentionally not user-facing.
+    args["translate_origin"] = [8.0, 8.0, 0.0]
     
     # remap texture size overrides value 0 => None
     if "texture_size_x_override" in args:
@@ -170,29 +145,6 @@ class ExportVintageStoryJson(Operator, ExportHelper):
         name="Skip Disabled Render",
         description="Skip objects with disabled render",
         default=True,
-    )
-
-    # applies default shift from vintagestory origin
-    do_translate_origin: BoolProperty(
-        name="Center Back on Origin",
-        description="Shift the exported model back onto the origin (0,0,0)",
-        default=False,
-    )
-    
-    translate_origin_x: FloatProperty(
-        name="Translate X",
-        description="X export offset (in Blender coordinates)",
-        default=8.,
-    )
-    translate_origin_y: FloatProperty(
-        name="Translate Y",
-        description="Y export offset (in Blender coordinates)",
-        default=8.,
-    )
-    translate_origin_z: FloatProperty(
-        name="Translate Z",
-        description="Z export offset (in Blender coordinates)",
-        default=0.,
     )
 
     # ================================
@@ -537,10 +489,6 @@ class VINTAGESTORY_PT_export_geometry(bpy.types.Panel):
         layout.prop(operator, "selection_only")
         layout.prop(operator, "skip_disabled_render")
         layout.prop(operator, "use_step_parent")
-        layout.prop(operator, "do_translate_origin")
-        layout.prop(operator, "translate_origin_x")
-        layout.prop(operator, "translate_origin_y")
-        layout.prop(operator, "translate_origin_z")
 
 
 # export options panel for textures
