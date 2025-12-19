@@ -18,7 +18,7 @@ importlib.reload(animation)
 DEG_TO_RAD = math.pi / 180.0
 RAD_TO_DEG = 180.0 / math.pi
 
-# direction names for minecraft cube face UVs
+# direction names for vs cube face UVs
 DIRECTIONS = np.array([
     "north",
     "east",
@@ -28,8 +28,8 @@ DIRECTIONS = np.array([
     "down",
 ])
 
-# normals for minecraft directions in BLENDER world space
-# e.g. blender (-1, 0, 0) is minecraft north (0, 0, -1)
+# normals for vs directions in BLENDER world space
+# e.g. blender (-1, 0, 0) is vs north (0, 0, -1)
 # shape (f,n) = (6,3)
 #   f = 6: number of cuboid faces to test
 #   v = 3: vertex coordinates (x,y,z)
@@ -43,7 +43,7 @@ DIRECTION_NORMALS = np.array([
 ])
 # DIRECTION_NORMALS = np.tile(DIRECTION_NORMALS[np.newaxis,...], (6,1,1))
 
-# blender counterclockwise uv -> minecraft uv rotation lookup table
+# blender counterclockwise uv -> vs uv rotation lookup table
 # (these values experimentally determined)
 # access using [uv_loop_start_index][vert_loop_start_index]
 COUNTERCLOCKWISE_UV_ROTATION_LOOKUP = (
@@ -53,10 +53,10 @@ COUNTERCLOCKWISE_UV_ROTATION_LOOKUP = (
     (270, 180, 90, 0),
 )
 
-# blender clockwise uv -> minecraft uv rotation lookup table
+# blender clockwise uv -> vs uv rotation lookup table
 # (these values experimentally determined)
 # access using [uv_loop_start_index][vert_loop_start_index]
-# Note: minecraft uv must also be x-flipped
+# Note: vs uv must also be x-flipped
 CLOCKWISE_UV_ROTATION_LOOKUP = (
     (90, 0, 270, 180),
     (0, 270, 180, 90),
@@ -319,12 +319,12 @@ def create_color_texture(
     - colors: Iterable of colors. Each color should be indexable like an rgb
               tuple c = (r, g, b), just so that r = c[0], b = c[1], g = c[2].
     - min_size: Minimum size of texture (must be power 2^n). By default
-                16 because Minecraft needs min sized 16 textures for 4 mipmap levels.'
+                16 because vs needs min sized 16 textures for 4 mipmap levels.'
     
     Returns:
     - tex_pixels: Flattened array of texture pixels.
     - tex_size: Size of image texture.
-    - color_tex_uv_map: Dict map from rgb tuple color to minecraft format uv coords
+    - color_tex_uv_map: Dict map from rgb tuple color to vs format uv coords
                         (r, g, b) -> (xmin, ymin, xmax, ymax)
     - default_color_uv: Default uv coords for unmapped materials (xmin, ymin, xmax, ymax).
     """
@@ -540,10 +540,10 @@ def generate_mesh_element(
     # ================================
     # texture/uv generation
     # 
-    # NOTE: BLENDER VS MINECRAFT/VINTAGE STORY UV AXIS
+    # NOTE: BLENDER VS vs/VINTAGE STORY UV AXIS
     # - blender: uvs origin is bottom-left (0,0) to top-right (1, 1)
-    # - minecraft/vs: uvs origin is top-left (0,0) to bottom-right (16, 16)
-    # minecraft uvs: [x1, y1, x2, y2], each value from [0, 16] as proportion of image
+    # - vs/vs: uvs origin is top-left (0,0) to bottom-right (16, 16)
+    # vs uvs: [x1, y1, x2, y2], each value from [0, 16] as proportion of image
     # as well as 0, 90, 180, 270 degree uv rotation
 
     # uv loop to export depends on:
@@ -1365,7 +1365,9 @@ ROTATION_MODE_TO_FCURVE_PROPERTY = {
 def save_all_animations(
     obj_armature,
     export_objects=None,
-    rotate_shortest_distance=True,  # kept for API compatibility; not used in v1 exporter
+    rotate_shortest_distance=False,
+    bake_animations=False,
+    bake_step=1,
     tol_loc=1e-4,
     tol_rot_deg=1e-3,
 ):
@@ -1543,11 +1545,24 @@ def save_all_animations(
             start, end = end, start
 
         # Always sample start/end; plus any keyed frames within bounds
-        frames = {start, end}
-        for f in keyed_frames:
-            if start <= f <= end:
-                frames.add(int(f))
-        frames = sorted(frames)
+        if bake_animations:
+            step = 1
+            try:
+                step = int(bake_step)
+            except Exception:
+                step = 1
+            if step <= 0:
+                step = 1
+
+            frames = list(range(start, end + 1, step))
+            if frames[-1] != end:
+                frames.append(end)
+        else:
+            frames = {start, end}
+            for f in keyed_frames:
+                if start <= f <= end:
+                    frames.add(int(f))
+            frames = sorted(frames)
 
         # Determine quantityframes (preserve on roundtrip if available)
         qf = action.get("vs_quantityframes", None)
@@ -1628,6 +1643,21 @@ def save_all_animations(
 
         keyframes_out = []
         any_motion = False
+        # Track previous VS-space euler angles per emitted element name so we can
+        # keep continuity when converting from quaternions (or ambiguous euler branches).
+        prev_rot = {}
+
+        def unwrap_axis(prev_val, cur_val):
+            """Return cur_val adjusted by +/-360*n to be closest to prev_val."""
+            try:
+                pv = float(prev_val)
+                cv = float(cur_val)
+                if not math.isfinite(pv) or not math.isfinite(cv):
+                    return cv
+                k = int(round((pv - cv) / 360.0))
+                return cv + 360.0 * k
+            except Exception:
+                return cur_val
 
         # Precompute rest matrices in world space
         rest_world = {}
@@ -1697,6 +1727,16 @@ def save_all_animations(
                 rot_y = safe_f(r[1])
                 rot_z = safe_f(r[2])
 
+                # Optional: keep Euler continuity between sampled frames.
+                # This is useful when Blender authored quaternion motion (slerp) is converted
+                # to Euler and the representation "jumps" by ±360 even though rotation is smooth.
+                out_name = bone_export_name(db)
+                if rotate_shortest_distance and out_name in prev_rot:
+                    prx, pry, prz = prev_rot[out_name]
+                    rot_x = unwrap_axis(prx, rot_x)
+                    rot_y = unwrap_axis(pry, rot_y)
+                    rot_z = unwrap_axis(prz, rot_z)
+
                 # snap tiny values to 0
                 if near_zero(off_x, tol_loc): off_x = 0.0
                 if near_zero(off_y, tol_loc): off_y = 0.0
@@ -1720,7 +1760,15 @@ def save_all_animations(
                     "rotationZ": rot_z,
                 }
 
-                frame_elements[bone_export_name(db)] = el
+                if rotate_shortest_distance:
+                    el["rotShortestDistanceX"] = True
+                    el["rotShortestDistanceY"] = True
+                    el["rotShortestDistanceZ"] = True
+
+                frame_elements[out_name] = el
+
+                if rotate_shortest_distance:
+                    prev_rot[out_name] = (rot_x, rot_y, rot_z)
 
             # Don't emit empty keyframes
             if frame_elements:
@@ -1930,8 +1978,11 @@ def save_objects(
     export_armature=False,
     export_animations=True,
     generate_animations_file=False,
+    bake_animations=False,
+    bake_step=1,
     use_main_object_as_bone=False,
     use_step_parent=True,
+    repair_hierarchy=False,
     rotate_shortest_distance=False,
     animation_version_0=False,
     logger=None,
@@ -1992,6 +2043,11 @@ def save_objects(
         Transform root elements relative to their step parent element, so
         elements are correctly attached in game.
         TODO: make this flag actually work, right now automatically enabled
+    repair_hierarchy : bool
+        Attempt to reconstruct a parent/child hierarchy for VS elements when the
+        original VS metadata (obj['vs_parent']) is missing or broken.
+        Useful for edge cases where objects were unparented or bone-parented
+        and animation inheritance breaks after export.
     rotate_shortest_distance : bool
         Use shortest distance rotation interpolation for animations.
         This sets the "rotShortestDistance_" flags in the output keyframes.
@@ -2379,13 +2435,136 @@ def save_objects(
                     name_to_obj[k.strip()] = o
 
         # parent map (VS hierarchy)
+        # Primary source: obj['vs_parent'] (set on import) so we can preserve VS hierarchy
+        # even when objects were bone-parented (which destroys Blender object parenting).
+        #
+        # Optional repair: when the user has cleared custom props / parenting, we can
+        # reconstruct a reasonable hierarchy using:
+        #   1) Blender object parenting (if present)
+        #   2) Armature bone parent chain (if bone-parented)
+        #   3) Spatial inference (smallest enclosing/closest element by AABB)
+        if repair_hierarchy and armature is not None and bone_hierarchy is None:
+            try:
+                _, bone_hierarchy = get_bone_hierarchy_from_armature(armature)
+            except Exception:
+                bone_hierarchy = None
+
+        def _infer_parent_from_bone(obj):
+            """If obj is bone-parented, infer its VS parent from the bone parent chain."""
+            try:
+                if armature is None or bone_hierarchy is None:
+                    return None
+                if getattr(obj, "parent", None) is None or getattr(obj.parent, "type", None) != "ARMATURE":
+                    return None
+                bone_name = getattr(obj, "parent_bone", "") or ""
+                if not bone_name:
+                    return None
+                bone = armature.data.bones.get(bone_name)
+                if bone is None or bone.parent is None:
+                    return None
+                pb = bone.parent
+                if pb.name not in bone_hierarchy:
+                    return None
+                p_obj = getattr(bone_hierarchy[pb.name], "main", None)
+                return p_obj if p_obj in elem_objs else None
+            except Exception:
+                return None
+
+        def _spatial_parent_map(objs):
+            """Infer a hierarchy when all metadata is missing.
+
+            Heuristic: choose the parent whose world-space AABB contains (or is closest to)
+            the child's origin, preferring the smallest such parent.
+            """
+            from mathutils import Vector
+            # Precompute world AABBs + origins
+            aabb = {}
+            origin = {}
+            vol = {}
+            for o in objs:
+                try:
+                    pts = [o.matrix_world @ Vector(c) for c in o.bound_box]
+                    mn = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+                    mx = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+                    aabb[o] = (mn, mx)
+                    origin[o] = o.matrix_world.translation.copy()
+                    d = mx - mn
+                    vol[o] = abs(d.x * d.y * d.z)
+                except Exception:
+                    aabb[o] = (Vector((0, 0, 0)), Vector((0, 0, 0)))
+                    origin[o] = Vector((0, 0, 0))
+                    vol[o] = 0.0
+
+            def _dist_point_aabb(p, mn, mx):
+                dx = max(mn.x - p.x, 0.0, p.x - mx.x)
+                dy = max(mn.y - p.y, 0.0, p.y - mx.y)
+                dz = max(mn.z - p.z, 0.0, p.z - mx.z)
+                return math.sqrt(dx*dx + dy*dy + dz*dz)
+
+            mapping = {}
+            for child in objs:
+                best_parent = None
+                best_key = None
+                child_v = vol.get(child, 0.0)
+                p0 = origin.get(child)
+                if p0 is None:
+                    mapping[child] = None
+                    continue
+                for cand in objs:
+                    if cand is child:
+                        continue
+                    # Prevent tiny mutual loops: parent should be meaningfully larger.
+                    if vol.get(cand, 0.0) < child_v * 1.01:
+                        continue
+                    mn, mx = aabb[cand]
+                    d = _dist_point_aabb(p0, mn, mx)
+                    key = (d, vol.get(cand, 0.0))
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_parent = cand
+                # If everything fails, root.
+                mapping[child] = best_parent
+            return mapping
+
         parent_map = {}
+        missing_vs_parent = 0
         for o in elem_objs:
             p = None
-            vs_parent = o.get("vs_parent")
+            try:
+                vs_parent = o.get("vs_parent")
+            except Exception:
+                vs_parent = None
+
             if isinstance(vs_parent, str) and vs_parent:
                 p = name_to_obj.get(vs_parent) or name_to_obj.get(vs_parent.strip())
+            else:
+                missing_vs_parent += 1
+
+            # Optional repairs for missing/broken vs_parent
+            if repair_hierarchy and p is None:
+                # 1) Blender object parenting (ignore Armature parent here)
+                try:
+                    if getattr(o, "parent", None) is not None and getattr(o.parent, "type", None) != "ARMATURE" and o.parent in elem_objs:
+                        p = o.parent
+                except Exception:
+                    pass
+
+            if repair_hierarchy and p is None:
+                # 2) Bone parent chain
+                p = _infer_parent_from_bone(o)
+
             parent_map[o] = p
+
+        # 3) Spatial inference as a last resort when the hierarchy is completely missing.
+        if repair_hierarchy and len(elem_objs) > 1 and missing_vs_parent == len(elem_objs):
+            try:
+                spatial = _spatial_parent_map(elem_objs)
+                # only fill where we still have no parent
+                for o in elem_objs:
+                    if parent_map.get(o) is None:
+                        parent_map[o] = spatial.get(o)
+            except Exception:
+                pass
 
         # attachpoints parent map: prefer stored vs_parent, else use Blender parent if it is a VS element
         attach_parent = {}
@@ -2629,6 +2808,8 @@ def save_objects(
             armature,
             export_objects=objects,
             rotate_shortest_distance=rotate_shortest_distance,
+            bake_animations=bake_animations,
+            bake_step=bake_step,
         )
         if len(animations) > 0:
             model_json["animations"] = animations

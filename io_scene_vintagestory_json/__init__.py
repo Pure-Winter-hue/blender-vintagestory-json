@@ -231,12 +231,53 @@ class ExportVintageStoryJson(Operator, ExportHelper):
         default=False,
     )
 
+    rotate_shortest_distance: BoolProperty(
+        name="Shortest-Path Rotations",
+        description=(
+            "Improve in-game rotation interpolation for animations authored in quaternion mode by "
+            "(a) unwrapping Euler windings during export and (b) setting rotShortestDistance flags "
+            "on keyframes. Enable this when VSMC looks correct but the game takes the long way around."
+        ),
+        default=False,
+    )
+
+    bake_animations: BoolProperty(
+        name="Bake Animations",
+        description=(
+            "Resample/bake animations to one keyframe per frame (or per step). "
+            "This removes differences caused by cubic vs linear interpolation or quaternion->Euler ambiguity, "
+            "at the cost of a larger JSON file."
+        ),
+        default=False,
+    )
+
+    bake_step: IntProperty(
+        name="Bake Step",
+        description="When baking, emit a keyframe every N frames (1 = every frame)",
+        default=1,
+        min=1,
+        soft_min=1,
+        soft_max=8,
+    )
+
     # ================================
     # step parent options
     use_step_parent: BoolProperty(
         name="Use Step Parent",
         description="Transform element relative to step parent (for attachments like clothes)",
         default=True,
+    )
+
+    # ================================
+    # hierarchy repair options
+    repair_hierarchy: BoolProperty(
+        name="Repair Hierarchy",
+        description=(
+            "Attempt to reconstruct a sensible VS element parent/child hierarchy when it was broken in Blender "
+            "(e.g. cleared parents, lost custom properties, or bone-parented rigs without stored vs_parent). "
+            "This can fix partial/non-inheriting animations in-game for edge-case files."
+        ),
+        default=False,
     )
 
     # ================================
@@ -569,6 +610,11 @@ class VINTAGESTORY_PT_export_animation(bpy.types.Panel):
 
         layout.prop(operator, "export_animations")
         layout.prop(operator, "generate_animations_file")
+        layout.prop(operator, "rotate_shortest_distance")
+        layout.prop(operator, "bake_animations")
+        row = layout.row()
+        row.enabled = bool(getattr(operator, "bake_animations", False))
+        row.prop(operator, "bake_step")
 
 
 class VINTAGESTORY_PT_export_scripts(bpy.types.Panel):
