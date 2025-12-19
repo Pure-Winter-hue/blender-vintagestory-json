@@ -29,7 +29,9 @@ Credits: Phonon worked massively hard to make the original, Sekelsta for identif
 
 - **Animation Import/Export**
   - Imports and exports Vintage Story animations with minimal fuss
-  - Shortest distance rotation + baking (use both together for best results) for STUBBORN older blender animations. <- Winter version, not from base tool.
+  - Shortest distance rotation - use with the 'sanitation' button (baking may not be useful) for any 'it looks fine in vsmc but not in game!!' scnearios. :) 
+  <img width="709" height="283" alt="image" src="https://github.com/user-attachments/assets/c74971db-4bf3-47be-960f-d18338993f78" />
+
 
 - **UV Unwrap: “View to Bounds”**
   - New unwrap mode designed for cuboids
