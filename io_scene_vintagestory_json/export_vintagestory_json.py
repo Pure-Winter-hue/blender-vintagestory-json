@@ -1366,6 +1366,7 @@ def save_all_animations(
     obj_armature,
     export_objects=None,
     rotate_shortest_distance=False,
+    smart_bake_only=False,
     bake_animations=False,
     bake_step=1,
     tol_loc=1e-4,
@@ -1544,25 +1545,73 @@ def save_all_animations(
         if end < start:
             start, end = end, start
 
-        # Always sample start/end; plus any keyed frames within bounds
-        if bake_animations:
+        # Decide which bones/channels need baking (cubic curves, modifiers, quaternion auth).
+        # When smart_bake_only is enabled we will bake only those bones, keeping others sparse.
+        step = 1
+        try:
+            step = int(bake_step)
+        except Exception:
             step = 1
-            try:
-                step = int(bake_step)
-            except Exception:
-                step = 1
-            if step <= 0:
-                step = 1
+        if step <= 0:
+            step = 1
 
-            frames = list(range(start, end + 1, step))
-            if frames[-1] != end:
-                frames.append(end)
+        baked_frames = list(range(start, end + 1, step))
+        if baked_frames and baked_frames[-1] != end:
+            baked_frames.append(end)
+
+        sparse_frames = {start, end}
+        for f in keyed_frames:
+            if start <= f <= end:
+                sparse_frames.add(int(f))
+        sparse_frames = sorted(sparse_frames)
+
+        # Per-bone frame emission plan (used for "bake only what needs baking").
+        # Keyframes in VS can omit elements, so we can keep non-problematic bones sparse
+        # while baking only the ones that need parity with Blender's cubic/quaternion motion.
+        frames_for_bone = {}
+        if bake_animations:
+            frames = baked_frames
+            for b in keyed_bones:
+                frames_for_bone[b] = set(frames)
+        elif smart_bake_only:
+            needs_bake = {b: False for b in keyed_bones}
+            for fcu in fcurves:
+                dp = getattr(fcu, "data_path", "") or ""
+                bname = extract_bone_from_datapath(dp)
+                if not bname or bname not in needs_bake:
+                    continue
+
+                # Any non-linear interpolation, any modifiers, or quaternion-authored curves
+                # get baked to avoid engine interpolation mismatches.
+                try:
+                    if getattr(fcu, "modifiers", None) and len(fcu.modifiers) > 0:
+                        needs_bake[bname] = True
+                except Exception:
+                    pass
+
+                if ".rotation_quaternion" in dp:
+                    needs_bake[bname] = True
+
+                try:
+                    for kp in getattr(fcu, "keyframe_points", []) or []:
+                        interp = getattr(kp, "interpolation", "LINEAR")
+                        if interp not in {"LINEAR", "CONSTANT"}:
+                            needs_bake[bname] = True
+                            break
+                except Exception:
+                    pass
+
+            all_frames = set()
+            for b in keyed_bones:
+                use_baked = needs_bake.get(b, False)
+                bf = baked_frames if use_baked else sparse_frames
+                frames_for_bone[b] = set(bf)
+                all_frames.update(frames_for_bone[b])
+            frames = sorted(all_frames)
         else:
-            frames = {start, end}
-            for f in keyed_frames:
-                if start <= f <= end:
-                    frames.add(int(f))
-            frames = sorted(frames)
+            frames = sparse_frames
+            for b in keyed_bones:
+                frames_for_bone[b] = set(frames)
 
         # Determine quantityframes (preserve on roundtrip if available)
         qf = action.get("vs_quantityframes", None)
@@ -1685,6 +1734,12 @@ def save_all_animations(
 
             for pb in animated_posebones:
                 bn = pb.name
+                # Smart bake: only emit this bone on frames we planned for it.
+                try:
+                    if bn in frames_for_bone and frame not in frames_for_bone[bn]:
+                        continue
+                except Exception:
+                    pass
                 db = data_bones.get(bn)
                 if db is None:
                     continue
@@ -1980,6 +2035,10 @@ def save_objects(
     generate_animations_file=False,
     bake_animations=False,
     bake_step=1,
+    smart_bake_only=False,
+    sanitize_keyframes=False,
+    sanitize_epsilon=1e-4,
+    sanitize_rot_clamp_deg=7200.0,
     use_main_object_as_bone=False,
     use_step_parent=True,
     repair_hierarchy=False,
@@ -2808,11 +2867,259 @@ def save_objects(
             armature,
             export_objects=objects,
             rotate_shortest_distance=rotate_shortest_distance,
+            smart_bake_only=smart_bake_only,
             bake_animations=bake_animations,
             bake_step=bake_step,
         )
         if len(animations) > 0:
             model_json["animations"] = animations
+
+    # =========================================================================
+    # Keyframe sanitizer (opt-in)
+    # - unwrap Euler angles per channel
+    # - snap near-zero noise to 0
+    # - clamp extreme values and report
+    # =========================================================================
+    def _isfinite_num(v):
+        try:
+            fv = float(v)
+            return math.isfinite(fv)
+        except Exception:
+            return False
+
+    def _sanitize_animations(anims, eps=1e-4, rot_clamp=7200.0):
+        issues = []
+        if not anims:
+            return issues
+        rot_clamp = abs(float(rot_clamp)) if rot_clamp is not None else 0.0
+        for anim in anims:
+            prev = {}  # element -> (rx, ry, rz)
+            # Iterate keyframes in order; for each element present, unwrap against last seen.
+            kfs = anim.get("keyframes", []) or []
+            kfs.sort(key=lambda k: int(k.get("frame", 0)))
+            for kf in kfs:
+                elems = kf.get("elements", {}) or {}
+                for ename, tr in elems.items():
+                    if not isinstance(tr, dict):
+                        continue
+
+                    # Snap small noise
+                    for key in ("offsetX", "offsetY", "offsetZ", "rotationX", "rotationY", "rotationZ"):
+                        if key in tr:
+                            try:
+                                val = float(tr[key])
+                                if not math.isfinite(val):
+                                    issues.append(f"Non-finite {key} on '{ename}' in anim '{anim.get('code', anim.get('name',''))}'. Set to 0.")
+                                    val = 0.0
+                                if abs(val) < eps:
+                                    val = 0.0
+                                tr[key] = val
+                            except Exception:
+                                issues.append(f"Non-numeric {key} on '{ename}' in anim '{anim.get('code', anim.get('name',''))}'. Set to 0.")
+                                tr[key] = 0.0
+
+                    # Unwrap rotations per-channel
+                    rx = float(tr.get("rotationX", 0.0))
+                    ry = float(tr.get("rotationY", 0.0))
+                    rz = float(tr.get("rotationZ", 0.0))
+
+                    if ename in prev:
+                        prx, pry, prz = prev[ename]
+                        def _unwrap(p, c):
+                            try:
+                                k = int(round((p - c) / 360.0))
+                                return c + 360.0 * k
+                            except Exception:
+                                return c
+                        rx = _unwrap(prx, rx)
+                        ry = _unwrap(pry, ry)
+                        rz = _unwrap(prz, rz)
+
+                    # Clamp extreme rotations (helps broken conversions)
+                    if rot_clamp > 0.0:
+                        def _clamp(v):
+                            if v > rot_clamp:
+                                return rot_clamp
+                            if v < -rot_clamp:
+                                return -rot_clamp
+                            return v
+                        crx, cry, crz = _clamp(rx), _clamp(ry), _clamp(rz)
+                        if (crx, cry, crz) != (rx, ry, rz):
+                            issues.append(f"Clamped rotation on '{ename}' in anim '{anim.get('code', anim.get('name',''))}'.")
+                        rx, ry, rz = crx, cry, crz
+
+                    tr["rotationX"], tr["rotationY"], tr["rotationZ"] = rx, ry, rz
+                    prev[ename] = (rx, ry, rz)
+        return issues
+
+    if sanitize_keyframes and "animations" in model_json:
+        san_issues = _sanitize_animations(model_json.get("animations", []), eps=sanitize_epsilon, rot_clamp=sanitize_rot_clamp_deg)
+        if san_issues:
+            print("\n[VS Export] Keyframe Sanitizer Report")
+            for s in san_issues[:200]:
+                print("  -", s)
+            if len(san_issues) > 200:
+                print(f"  ... {len(san_issues)-200} more")
+            if logger is not None:
+                try:
+                    logger.report({"WARNING"}, f"Keyframe sanitizer: {len(san_issues)} notes (see console)")
+                except Exception:
+                    pass
+
+    # =========================================================================
+    # Export validation report (ALWAYS runs; hard-fails on critical issues)
+    # =========================================================================
+    def _collect_elements(el_list):
+        out = []
+        stack = list(el_list or [])
+        while stack:
+            e = stack.pop()
+            if not isinstance(e, dict):
+                continue
+            out.append(e)
+            for c in e.get("children", []) or []:
+                stack.append(c)
+        return out
+
+    def _validate_export(model):
+        errors = []
+        warnings = []
+
+        roots = model.get("elements", []) or []
+        if len(roots) == 0:
+            errors.append("No exported elements found.")
+        elif len(roots) > 1:
+            warnings.append(f"Model has {len(roots)} root elements (valid, but often indicates broken parenting).")
+
+        elems = _collect_elements(roots)
+        names = []
+        for e in elems:
+            n = e.get("name", None)
+            if isinstance(n, str):
+                names.append(n)
+        name_set = set(names)
+        if len(name_set) != len(names):
+            # duplicates are almost always fatal for animation resolution
+            dup = sorted({n for n in names if names.count(n) > 1})
+            errors.append(f"Duplicate element names detected: {', '.join(dup[:20])}" + ("..." if len(dup) > 20 else ""))
+
+        # Validate element numeric sanity
+        def _num_ok(v):
+            try:
+                fv = float(v)
+                return math.isfinite(fv)
+            except Exception:
+                return False
+
+        for e in elems:
+            fn = e.get("name", "<unnamed>")
+            fr = e.get("from", None)
+            to = e.get("to", None)
+            ro = e.get("rotationOrigin", None)
+            for label, arr in (("from", fr), ("to", to), ("rotationOrigin", ro)):
+                if arr is None:
+                    errors.append(f"Element '{fn}' missing '{label}'.")
+                    continue
+                if not isinstance(arr, (list, tuple)) or len(arr) != 3:
+                    errors.append(f"Element '{fn}' has invalid '{label}' (expected 3 numbers).")
+                    continue
+                if not all(_num_ok(x) for x in arr):
+                    errors.append(f"Element '{fn}' has non-finite values in '{label}'.")
+
+            # size sanity
+            if isinstance(fr, (list, tuple)) and isinstance(to, (list, tuple)) and len(fr) == 3 and len(to) == 3:
+                try:
+                    sx, sy, sz = float(to[0]) - float(fr[0]), float(to[1]) - float(fr[1]), float(to[2]) - float(fr[2])
+                    if sx < 0 or sy < 0 or sz < 0:
+                        errors.append(f"Element '{fn}' has negative size (to < from).")
+                    elif sx == 0 or sy == 0 or sz == 0:
+                        warnings.append(f"Element '{fn}' has zero size on at least one axis.")
+                except Exception:
+                    pass
+
+        # Validate animations
+        anims = model.get("animations", []) or []
+        if anims:
+            for anim in anims:
+                acode = anim.get("code", anim.get("name", "<anim>"))
+                kfs = anim.get("keyframes", []) or []
+                if not kfs:
+                    errors.append(f"Animation '{acode}' has no keyframes.")
+                    continue
+                # Track last values for extreme-delta detection per element
+                last = {}
+                for kf in kfs:
+                    if "frame" not in kf:
+                        errors.append(f"Animation '{acode}' has a keyframe missing 'frame'.")
+                        continue
+                    elems_k = kf.get("elements", None)
+                    if elems_k is None or not isinstance(elems_k, dict):
+                        errors.append(f"Animation '{acode}' keyframe {kf.get('frame','?')} missing 'elements' dict.")
+                        continue
+                    for ename, tr in elems_k.items():
+                        if ename not in name_set:
+                            errors.append(f"Animation '{acode}' targets missing element '{ename}'.")
+                            continue
+                        if not isinstance(tr, dict):
+                            errors.append(f"Animation '{acode}' keyframe {kf.get('frame','?')} element '{ename}' has invalid transform.")
+                            continue
+                        for key in ("offsetX", "offsetY", "offsetZ", "rotationX", "rotationY", "rotationZ"):
+                            if key not in tr:
+                                errors.append(f"Animation '{acode}' element '{ename}' missing '{key}'.")
+                                continue
+                            if not _num_ok(tr[key]):
+                                errors.append(f"Animation '{acode}' element '{ename}' has non-finite '{key}'.")
+
+                        # extreme delta check (warn; doesn't fail unless absurd)
+                        try:
+                            cur = (
+                                float(tr.get("offsetX", 0.0)), float(tr.get("offsetY", 0.0)), float(tr.get("offsetZ", 0.0)),
+                                float(tr.get("rotationX", 0.0)), float(tr.get("rotationY", 0.0)), float(tr.get("rotationZ", 0.0)),
+                            )
+                            if ename in last:
+                                prevv = last[ename]
+                                drot = max(abs(cur[3]-prevv[3]), abs(cur[4]-prevv[4]), abs(cur[5]-prevv[5]))
+                                dpos = max(abs(cur[0]-prevv[0]), abs(cur[1]-prevv[1]), abs(cur[2]-prevv[2]))
+                                if drot > 1440:
+                                    warnings.append(f"Animation '{acode}' element '{ename}' has large rotation jump ({drot:.1f} deg).")
+                                if drot > 20000:
+                                    errors.append(f"Animation '{acode}' element '{ename}' has absurd rotation jump ({drot:.1f} deg).")
+                                if dpos > 2000:
+                                    warnings.append(f"Animation '{acode}' element '{ename}' has large offset jump ({dpos:.3f}).")
+                                if dpos > 1e6:
+                                    errors.append(f"Animation '{acode}' element '{ename}' has absurd offset jump ({dpos:.3f}).")
+                            last[ename] = cur
+                        except Exception:
+                            pass
+
+        return errors, warnings
+
+    v_errors, v_warnings = _validate_export(model_json)
+    if v_errors or v_warnings:
+        print("\n[VS Export] Validation Report")
+        if v_errors:
+            print("Errors:")
+            for e in v_errors:
+                print("  -", e)
+        if v_warnings:
+            print("Warnings:")
+            for w in v_warnings[:200]:
+                print("  -", w)
+            if len(v_warnings) > 200:
+                print(f"  ... {len(v_warnings)-200} more")
+
+    if v_errors:
+        if logger is not None:
+            try:
+                logger.report({"ERROR"}, f"Export validation failed: {len(v_errors)} error(s) (see console)")
+            except Exception:
+                pass
+        return {"CANCELLED"}, {"ERROR"}, "Export cancelled due to validation errors (see console)"
+    elif v_warnings and logger is not None:
+        try:
+            logger.report({"WARNING"}, f"Export validation: {len(v_warnings)} warning(s) (see console)")
+        except Exception:
+            pass
 
     # =========================================================================
     # minification options to reduce .json file size

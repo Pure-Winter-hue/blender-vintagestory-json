@@ -260,6 +260,44 @@ class ExportVintageStoryJson(Operator, ExportHelper):
         soft_max=8,
     )
 
+    smart_bake_only: BoolProperty(
+        name="Bake Only What Needs Baking",
+        description=(
+            "Detect non-linear interpolation or quaternion-authored motion and bake only those bones/channels. "
+            "Keeps the rest as sparse keys to reduce JSON size while improving in-game parity."
+        ),
+        default=False,
+    )
+
+    sanitize_keyframes: BoolProperty(
+        name="Keyframe Sanitizer",
+        description=(
+            "Post-process exported keyframes to improve engine stability: unwrap Euler angles per channel, "
+            "snap near-zero noise to 0, clamp extreme values, and report issues."
+        ),
+        default=False,
+    )
+
+    sanitize_epsilon: FloatProperty(
+        name="Sanitize Epsilon",
+        description="Values with absolute magnitude below this are snapped to 0 (helps jitter/noise)",
+        default=1e-4,
+        min=0.0,
+        soft_min=0.0,
+        soft_max=1e-2,
+        precision=6,
+    )
+
+    sanitize_rot_clamp_deg: FloatProperty(
+        name="Rotation Clamp (deg)",
+        description="Clamp exported rotation channels to +/- this many degrees (extreme values are likely broken)",
+        default=7200.0,
+        min=0.0,
+        soft_min=180.0,
+        soft_max=36000.0,
+        precision=1,
+    )
+
     # ================================
     # step parent options
     use_step_parent: BoolProperty(
@@ -615,6 +653,14 @@ class VINTAGESTORY_PT_export_animation(bpy.types.Panel):
         row = layout.row()
         row.enabled = bool(getattr(operator, "bake_animations", False))
         row.prop(operator, "bake_step")
+
+        layout.prop(operator, "smart_bake_only")
+        layout.separator()
+        layout.prop(operator, "sanitize_keyframes")
+        col = layout.column()
+        col.enabled = bool(getattr(operator, "sanitize_keyframes", False))
+        col.prop(operator, "sanitize_epsilon")
+        col.prop(operator, "sanitize_rot_clamp_deg")
 
 
 class VINTAGESTORY_PT_export_scripts(bpy.types.Panel):
