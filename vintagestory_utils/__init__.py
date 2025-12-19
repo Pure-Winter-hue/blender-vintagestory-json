@@ -11,6 +11,8 @@ importlib.reload(model)
 importlib.reload(primitive)
 importlib.reload(texture)
 
+addon_keymaps = []
+
 def rna_idprop_context_value(context, context_member, property_type):
     """
     https://github.com/blender/blender/blob/main/scripts/modules/rna_prop_ui.py
@@ -141,6 +143,13 @@ class VINTAGESTORY_PT_panel_model_tools(bpy.types.Panel):
             operator="vintagestory.cleanup_rotation",
             icon="DRIVER_ROTATIONAL_DIFFERENCE",
             text="Cleanup Rotation",
+        )
+
+        # operator: disable selected faces (VSMC-style: exports as enabled=false)
+        layout.operator(
+            operator="vintagestory.disable_face",
+            icon="HIDE_OFF",
+            text="Disable Face (selected)",
         )
 
         # operator: mirror selected objects without negative scales (VS JSON safe)
@@ -466,6 +475,7 @@ classes = [
     texture.OpUVPixelUnwrap,
     texture.OpUVPackSimpleBoundingBox,
     texture.OpDisableMaterial,
+    texture.OpDisableFace,
     # PANELS AND MENUS
     VIEW3D_MT_vintagestory_submenu,
     VINTAGESTORY_PT_panel_model_tools,
@@ -480,10 +490,27 @@ def register():
     for cls in classes:
         register_class(cls)
 
+# keymap: Ctrl+Alt+D in Mesh Edit Mode
+wm = bpy.context.window_manager
+kc = getattr(wm, "keyconfigs", None)
+kc_addon = None if kc is None else kc.addon
+if kc_addon is not None:
+    km = kc_addon.keymaps.new(name="Mesh", space_type="EMPTY")
+    kmi = km.keymap_items.new("vintagestory.disable_face", type="D", value="PRESS", ctrl=True, alt=True)
+    addon_keymaps.append((km, kmi))
+
     # add minecraft primitives to object add menu
     bpy.types.VIEW3D_MT_add.append(add_submenu)
 
 def unregister():
+    # remove keymaps
+    for km, kmi in addon_keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except Exception:
+            pass
+    addon_keymaps.clear()
+
     # remove minecraft primitives from object add menu
     bpy.types.VIEW3D_MT_add.remove(add_submenu)
     

@@ -572,6 +572,23 @@ def generate_mesh_element(
         "down": {"texture": "#0", "uv": [0, 0, 4, 4], "autoUv": False},
     }
 
+    # Disabled face directions persisted on the object (importer/op).
+    # Stored as a list of VS direction strings, e.g. ['down', 'up'].
+    disabled_dirs_prop = set()
+    try:
+        v = obj.get("vs_disabled_faces")
+        if isinstance(v, (list, tuple, set)):
+            disabled_dirs_prop = set(str(x) for x in v)
+        elif isinstance(v, str) and v:
+            try:
+                vv = json.loads(v)
+                if isinstance(vv, (list, tuple, set)):
+                    disabled_dirs_prop = set(str(x) for x in vv)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # Robust UV access for Blender 4.x+.
     # In Blender 4.x/4.5, UVs may be backed by mesh.attributes (CORNER/FLOAT2)
     # and mesh.uv_layers.active.data can sometimes be empty (len==0).
@@ -671,7 +688,22 @@ def generate_mesh_element(
         return (v[1], v[0])
 
     for d, poly_indices in dir_polys.items():
+
+        # If this face direction is explicitly marked disabled, export as disabled.
+        if d in disabled_dirs_prop:
+            faces[d]["texture"] = "#0"
+            faces[d]["uv"] = [0, 0, 0, 0]
+            faces[d]["autoUv"] = False
+            faces[d]["enabled"] = False
+            faces[d].pop("rotation", None)
+            faces[d].pop("glow", None)
+            continue
         if not poly_indices:
+            # Face missing in Blender mesh: treat as a disabled face in VS JSON
+            faces[d]["texture"] = "#0"
+            faces[d]["uv"] = [0, 0, 0, 0]
+            faces[d]["autoUv"] = False
+            faces[d]["enabled"] = False
             continue
 
         # Representative polygon: largest area for stable winding/loop start.
@@ -685,7 +717,10 @@ def generate_mesh_element(
 
         # disabled face
         if face_material.type == FaceMaterial.DISABLE:
-            faces[d]["texture"] = "#" + face_material.name
+            faces[d]["texture"] = "#0"  # VSMC-style disabled face
+            # VSMC-style disabled face: keep explicit marker and clear UVs.
+            faces[d]["uv"] = [0, 0, 0, 0]
+            faces[d]["autoUv"] = False
             faces[d]["enabled"] = False
             continue
         # solid color tuple
@@ -698,7 +733,7 @@ def generate_mesh_element(
         if face_material.type != FaceMaterial.TEXTURE:
             continue
 
-        faces[d]["texture"] = "#" + face_material.name
+        faces[d]["texture"] = "#0"  # VSMC-style disabled face
         model_textures[face_material.name] = face_material
 
         # face glow
@@ -770,6 +805,16 @@ def generate_mesh_element(
         if not uv_samples or not rep_uvs:
             continue
 
+        if not uv_samples:
+            # No UV data for this face: treat as disabled.
+            faces[d]["texture"] = "#0"
+            faces[d]["uv"] = [0, 0, 0, 0]
+            faces[d]["autoUv"] = False
+            faces[d]["enabled"] = False
+            faces[d].pop("rotation", None)
+            faces[d].pop("glow", None)
+            continue
+
         uv_min_x = min(u for u, _ in uv_samples)
         uv_max_x = max(u for u, _ in uv_samples)
         uv_min_y = min(v for _, v in uv_samples)
@@ -834,6 +879,17 @@ def generate_mesh_element(
             ymin, ymax = ymax, ymin
 
         faces[d]["uv"] = [xmin, ymin, xmax, ymax]
+
+        # If UVs are fully cleared (VSMC-style disable), export as disabled even if geometry exists.
+        eps = 1e-6
+        if (abs(xmin) <= eps and abs(ymin) <= eps and abs(xmax) <= eps and abs(ymax) <= eps):
+            faces[d]["texture"] = "#0"
+            faces[d]["uv"] = [0, 0, 0, 0]
+            faces[d]["autoUv"] = False
+            faces[d]["enabled"] = False
+            faces[d].pop("rotation", None)
+            faces[d].pop("glow", None)
+            continue
 
         if face_uv_rotation != 0 and face_uv_rotation != 360:
             faces[d]["rotation"] = face_uv_rotation if face_uv_rotation >= 0 else 360 + face_uv_rotation

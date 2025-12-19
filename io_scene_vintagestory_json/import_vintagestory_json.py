@@ -31,10 +31,7 @@ DIRECTIONS = np.array([
 
 # normals for vs directions in BLENDER world space
 # e.g. blender (-1, 0, 0) is vs north (0, 0, -1)
-# shape (f,n,v) = (6,6,3)
-#   f = 6: number of cuboid faces to test
-#   n = 6: number of normal directions
-#   v = 3: vector coordinates (x,y,z)
+# shape (n,v) = (6,3)
 DIRECTION_NORMALS = np.array([
     [-1.,  0.,  0.],
     [ 0.,  1.,  0.],
@@ -43,7 +40,6 @@ DIRECTION_NORMALS = np.array([
     [ 0.,  0.,  1.],
     [ 0.,  0., -1.],
 ])
-DIRECTION_NORMALS = np.tile(DIRECTION_NORMALS[np.newaxis,...], (6,1,1))
 
 
 def index_of(val, in_list):
@@ -223,6 +219,61 @@ def parse_element(
         except Exception:
             element_uv0 = None
 
+    # -------------------------------------------------------------------------
+    # Disabled faces (VSMC style)
+    # A face may be disabled by setting face["enabled"]=false OR by setting its UV rect to all zeros.
+    # We represent a disabled face in Blender by deleting that quad from the cuboid mesh (visual-only).
+    # -------------------------------------------------------------------------
+    def _is_disabled_face(face_dict):
+        if not isinstance(face_dict, dict):
+            return False
+        if face_dict.get("enabled", True) is False:
+            return True
+        uv = face_dict.get("uv")
+        if isinstance(uv, (list, tuple)):
+            try:
+                uv_f = [float(x) for x in uv]
+            except Exception:
+                uv_f = []
+            if len(uv_f) >= 2 and all(abs(x) < 1e-9 for x in uv_f):
+                # Handles [0,0,0,0] and also oddball [0,0,0] exports
+                return True
+        return False
+    
+    disabled_dirs = {d for d, fdict in uv_faces.items() if _is_disabled_face(fdict)}
+    if disabled_dirs:
+
+        # Persist disabled face directions on the object for lossless round-tripping.
+        # Export will honor this even if geometry is later edited.
+        try:
+            obj["vs_disabled_faces"] = sorted(list(disabled_dirs))
+        except Exception:
+            pass
+
+        try:
+            import bmesh
+            # Map current cube polygons to VS face directions by normal.
+            # Map face normal -> direction index, then to direction name.
+            # Works even if the cuboid has < 6 faces (e.g. VSMC-disabled faces).
+            face_normals = np.array([f.normal[:] for f in mesh.polygons], dtype=float)  # (F,3)
+            # Dot each face normal with the 6 canonical axis normals -> (F,6)
+            dots = face_normals @ DIRECTION_NORMALS.T
+            dir_idx = np.argmax(dots, axis=1)
+            face_dirs = DIRECTIONS[dir_idx]
+    
+            delete_poly_indices = [i for i, d in enumerate(face_dirs) if d in disabled_dirs]
+            if delete_poly_indices:
+                bm = bmesh.new()
+                bm.from_mesh(mesh)
+                bm.faces.ensure_lookup_table()
+                for pi in sorted(delete_poly_indices, reverse=True):
+                    if pi < len(bm.faces):
+                        bmesh.ops.delete(bm, geom=[bm.faces[pi]], context="FACES")
+                bm.to_mesh(mesh)
+                bm.free()
+        except Exception as ex:
+            print(f"[VS Import] Failed to delete disabled faces: {ex}")
+    
     # Precompute "autoUv" rectangles from element-level uv offset (VSMC style).
     # Many VSMC/Vintage Story shapes use element["uv"] with face["autoUv"]=true and omit explicit per-face uv rectangles.
     auto_uv_rects = None
@@ -297,15 +348,12 @@ def parse_element(
         # Detect mesh face directions from normals.
         # We compute the best matching direction by dot-product against the
         # canonical face normals (same approach as the original importer).
-        face_normals = np.zeros((len(mesh.polygons), 1, 3), dtype=float)
-        for i, face in enumerate(mesh.polygons):
-            # face.normal is a mathutils.Vector
-            face_normals[i, 0, 0:3] = face.normal
-
         # Map face normal -> direction index, then to direction name.
-        # DIRECTION_NORMALS has shape (6,6,3) and broadcasts against (F,1,3)
-        # producing (F,6,3) before summing over vector components.
-        dir_idx = np.argmax(np.sum(face_normals * DIRECTION_NORMALS, axis=2), axis=1)
+        # Works even if the cuboid has < 6 faces (e.g. VSMC-disabled faces).
+        face_normals = np.array([f.normal[:] for f in mesh.polygons], dtype=float)  # (F,3)
+        # Dot each face normal with the 6 canonical axis normals -> (F,6)
+        dots = face_normals @ DIRECTION_NORMALS.T
+        dir_idx = np.argmax(dots, axis=1)
         face_directions = DIRECTIONS[dir_idx]
 
         for uv_direction, face in zip(face_directions, mesh.polygons):

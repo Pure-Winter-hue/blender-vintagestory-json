@@ -1,9 +1,9 @@
 bl_info = {
-    "name": "Vintage Story JSON Import/Export (Validation + Smart Bake)",
-    "description": "Vintage Story JSON import/export",
+    "name": "Vintage Story JSON Import/Export",
+    "description": "Tool for modeling/uv/anim/exporting VS JSON from Blender.",
     "author": "phonon, Pure Winter",
-    "version": (0, 9, 0),
-    "blender": (4, 5, 5),
+    "version": (0, 9, 1),
+    "blender": (4, 5, 0),
     "location": "File > Import-Export",
     "warning": "",
     "tracker_url": "https://github.com/Pure-Winter-hue/blender-vintagestory-json",

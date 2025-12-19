@@ -2410,6 +2410,113 @@ class OpDisableMaterial(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class OpDisableFace(bpy.types.Operator):
+    """Disable selected faces (VSMC-style).
+
+    This deletes the selected polygon(s) from the mesh (visual-only). The exporter
+    will write these as faces with "enabled": false and UVs cleared.
+    """
+    bl_idname = "vintagestory.disable_face"
+    bl_label = "Disable Face"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        import bmesh
+
+        if context.mode != "EDIT_MESH":
+            self.report({"ERROR"}, "Must select faces in Edit Mode")
+            return {"CANCELLED"}
+
+        obj = context.object
+        me = obj.data
+        bm = bmesh.from_edit_mesh(me)
+        bm.faces.ensure_lookup_table()
+
+        sel_faces = [f for f in bm.faces if f.select]
+        if not sel_faces:
+            self.report({"WARNING"}, "No faces selected.")
+            return {"CANCELLED"}
+
+        # Ensure UV layer exists
+        uv_layer = bm.loops.layers.uv.verify()
+
+        # Create/get a disabled material (for visual feedback + optional exporter DISABLE detection)
+        disabled_mat_name = "VS_DISABLED_FACE"
+        disabled_mat = bpy.data.materials.get(disabled_mat_name)
+        if disabled_mat is None:
+            disabled_mat = bpy.data.materials.new(disabled_mat_name)
+            disabled_mat["disable"] = True
+            try:
+                disabled_mat.diffuse_color = (1.0, 0.2, 0.2, 0.25)
+            except Exception:
+                pass
+
+        # Ensure material slot on mesh
+        mats = obj.data.materials
+        if disabled_mat_name not in [m.name for m in mats if m]:
+            mats.append(disabled_mat)
+        disabled_slot_index = next(i for i,m in enumerate(mats) if m and m.name == disabled_mat_name)
+
+        # Load/merge existing disabled dirs
+        disabled_dirs = set()
+        try:
+            v = obj.get("vs_disabled_faces")
+            if isinstance(v, (list, tuple, set)):
+                disabled_dirs |= set(str(x) for x in v)
+            elif isinstance(v, str) and v:
+                # allow JSON list string
+                try:
+                    import json as _json
+                    vv = _json.loads(v)
+                    if isinstance(vv, (list, tuple, set)):
+                        disabled_dirs |= set(str(x) for x in vv)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Direction mapping based on face normal (same ordering as exporter)
+        dirs = ["north", "east", "west", "south", "up", "down"]
+        normals = [(-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, -1.0, 0.0),
+                   (1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 0.0, -1.0)]
+        def best_dir(n):
+            # n is (x,y,z)
+            best_i, best_dot = 0, -1e9
+            for i, ax in enumerate(normals):
+                d = n[0]*ax[0] + n[1]*ax[1] + n[2]*ax[2]
+                if d > best_dot:
+                    best_dot, best_i = d, i
+            return dirs[best_i]
+
+        for f in sel_faces:
+            # Clear UVs to (0,0) on all loops (VSMC-style)
+            for loop in f.loops:
+                loop[uv_layer].uv[0] = 0.0
+                loop[uv_layer].uv[1] = 0.0
+
+            # Assign disabled material for visual feedback (optional)
+            f.material_index = disabled_slot_index
+
+            # Record direction for lossless export
+            disabled_dirs.add(best_dir((f.normal.x, f.normal.y, f.normal.z)))
+
+            # Optional: hide face visually in edit mode (non-destructive)
+            try:
+                f.hide_set(True)
+            except Exception:
+                pass
+
+        try:
+            obj["vs_disabled_faces"] = sorted(list(disabled_dirs))
+        except Exception:
+            pass
+
+        bmesh.update_edit_mesh(me, loop_triangles=False, destructive=False)
+
+
+        return {"FINISHED"}
+
+
 class OpAssignGlow(bpy.types.Operator):
     """Assign glow custom property to object (0 to remove)"""
     bl_idname = "vintagestory.assign_glow"
