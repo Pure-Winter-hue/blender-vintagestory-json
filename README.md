@@ -2,7 +2,7 @@
 
 A slowly evolving “new” Blender tool, reflavored from the main branch.
 
-**Status:** ⚠️ Highly Experimental
+**Status:** ⚠️ Semi Experimental 
 
 ---
 
@@ -25,6 +25,7 @@ A slowly evolving “new” Blender tool, reflavored from the main branch.
 
 - **Animation Import/Export**
   - Imports and exports Vintage Story animations with minimal fuss
+  - Shortest distance rotation + baking (use both together for best results) for STUBBORN older blender animations. <- Winter version, not from base tool.
 
 - **UV Unwrap: “View to Bounds”**
   - New unwrap mode designed for cuboids
@@ -40,7 +41,7 @@ A slowly evolving “new” Blender tool, reflavored from the main branch.
 
 ---
 
-## Contributing / Feedback
+## Contributing / Feedback - 
 
 Issues, repro files, and screenshots are welcome.
 If something breaks, include:
