@@ -2,6 +2,7 @@
 <img width="1920" height="1080" alt="vsblendertool" src="https://github.com/user-attachments/assets/8f26c697-6284-4593-ab34-a5d5a88a59f9" />
 
 A slowly evolving “new” Blender tool, reflavored from the main branch.
+Credits: Phonon worked massively hard to make the original, Sekelsta for identifying some blender to VS comptibility workflow and providing sample files to test on, everyone who contributed to the main plugin which is the backbone of this extension of it.
 
 **Status:** ⚠️ Semi Experimental 
 
