@@ -11,9 +11,14 @@ Credits: Phonon worked massively hard to make the original, Sekelsta for identif
 ## Features
 <img width="277" height="810" alt="image" src="https://github.com/user-attachments/assets/13769071-166e-40c2-8fab-23bd43f0e1db" />
 
+ - **Disabled Faces Support**
+   - Maintains VSMC disabled faces on import/export. (Yes, even hair/feather cards.)
+   - You can now disable faces for VSMC from the tool. (press N to see tool.) Go to edit mode, face selection mode, click face, click button on tool. [This is different then deleting or hiding a face in blender.]
+   <img width="953" height="423" alt="Screenshot 2025-12-19 065909" src="https://github.com/user-attachments/assets/772f90af-1e36-4eed-8c2b-e101b9d1c96d" />
+
 
 - **Mirror Button**
-  - Duplicates selection
+  - Duplicates selection (includes disabled faces/armature!)
   - Auto-renames `L`/`Left` → `R`/`Right`
   - Flips geometry and bones relative to the **3D Cursor**
     - Tip: place the cursor at **World Origin** for the intended workflow
