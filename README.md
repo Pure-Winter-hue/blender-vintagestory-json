@@ -1,4 +1,5 @@
 # Winter's Development Branch
+<img width="1920" height="1080" alt="vsblendertool" src="https://github.com/user-attachments/assets/8f26c697-6284-4593-ab34-a5d5a88a59f9" />
 
 A slowly evolving “new” Blender tool, reflavored from the main branch.
 
