@@ -9,6 +9,8 @@ Credits: Phonon worked massively hard to make the original, Sekelsta for identif
 ---
 
 ## Features
+<img width="277" height="810" alt="image" src="https://github.com/user-attachments/assets/13769071-166e-40c2-8fab-23bd43f0e1db" />
+
 
 - **Mirror Button**
   - Duplicates selection
