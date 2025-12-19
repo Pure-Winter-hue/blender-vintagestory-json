@@ -44,7 +44,8 @@ A slowly evolving “new” Blender tool, reflavored from the main branch.
 
 ## Contributing / Feedback - 
 
-Issues, repro files, and screenshots are welcome.
+Issues, repro files, and screenshots are welcome in 'issues' or directly on discord in its dedicated channel:
+https://discord.com/channels/302152934249070593/1451452685520998440/1451452685520998440
 If something breaks, include:
 - Blender version
 - Model JSON (or a minimal sample)
