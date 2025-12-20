@@ -187,6 +187,20 @@ class VINTAGESTORY_PT_panel_texture_tools(bpy.types.Panel):
             icon="UV_DATA",
             text="Cuboid UV Unwrap",
         )
+
+        # operator: unwrap selected face(s) as "middle" with left/right adjacent faces
+        layout.operator(
+            operator="vintagestory.uv_directional_entity_unwrap",
+            icon="UV_DATA",
+            text="Directional Entity Unwrap",
+        )
+
+        # operator: unwrap only the selected faces with directional basis
+        layout.operator(
+            operator="vintagestory.uv_single_direction_unwrap",
+            icon="UV_DATA",
+            text="Single Direction Unwrap",
+        )
         # operator: unwrap selected cuboids based on current viewport orientation
         layout.operator(
             operator="vintagestory.uv_cuboid_unwrap_project_from_view",
@@ -469,6 +483,8 @@ classes = [
     animation.OpActionOnActivityStopped,
     texture.OpAssignGlow,
     texture.OpUVCuboidUnwrap,
+    texture.OpUVDirectionalEntityUnwrap,
+    texture.OpUVSingleDirectionUnwrap,
     texture.OpUVCuboidUnwrapProjectFromView,
     texture.OpUVCuboidUnwrapProjectFromViewToBounds,
     texture.OpUVCuboidMakeCuboidUV,

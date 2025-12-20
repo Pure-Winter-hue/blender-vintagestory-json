@@ -2359,6 +2359,909 @@ class OpUVPackSimpleBoundingBox(bpy.types.Operator):
         
         return {"FINISHED"}
 
+
+# =============================================================================
+# Directional Entity Unwrap
+# =============================================================================
+
+def _choose_nonparallel_axis(n: Vector) -> Vector:
+    """Pick a stable 'up' axis not parallel to the given normal."""
+    axes = [Vector((0.0, 0.0, 1.0)), Vector((0.0, 1.0, 0.0)), Vector((1.0, 0.0, 0.0))]
+    best = axes[0]
+    best_score = 1e9
+    for a in axes:
+        score = abs(n.dot(a))
+        if score < best_score:
+            best_score = score
+            best = a
+    return best
+
+
+def _project_uv_rect(face: bmesh.types.BMFace, uv_layer, *, u_dir: Vector, v_dir: Vector):
+    """Project a quad face to a UV rectangle using u_dir/v_dir basis.
+
+    Returns:
+      uvs_by_loop: dict(loop -> Vector2)
+      width, height: float
+    """
+    # Guard: only quads for sane rectangles
+    if len(face.loops) != 4:
+        raise ValueError("Directional unwrap supports quad faces only")
+
+    u_dir = u_dir.normalized()
+    v_dir = v_dir.normalized()
+
+    raw = []
+    for loop in face.loops:
+        p = loop.vert.co
+        raw.append((loop, p.dot(u_dir), p.dot(v_dir)))
+
+    umin = min(r[1] for r in raw)
+    umax = max(r[1] for r in raw)
+    vmin = min(r[2] for r in raw)
+    vmax = max(r[2] for r in raw)
+
+    w = umax - umin
+    h = vmax - vmin
+    # Avoid zeros (degenerate faces)
+    if w <= 1e-10 or h <= 1e-10:
+        raise ValueError("Degenerate face (zero area) in directional unwrap")
+
+    uvs = {}
+    for loop, u, v in raw:
+        uvs[loop] = Vector((u - umin, v - vmin))
+    return uvs, float(w), float(h)
+
+
+class OpUVDirectionalEntityUnwrap(bpy.types.Operator):
+    """Unwrap selected face(s) as the 'back/middle' and place adjacent left/right faces as a strip.
+
+    Workflow:
+      - In Edit Mode, select the face(s) that represent the 'middle' (usually the back).
+      - Run this operator.
+
+    Result:
+      A 3-face horizontal strip in UVs: [left][middle][right]
+    """
+    bl_idname = "vintagestory.uv_directional_entity_unwrap"
+    bl_label = "Directional Entity Unwrap"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def _infer_texture_size(self, context, obj=None, *, default_size: int = 32) -> tuple[float, float]:
+        """Best-effort texture size for UV normalization.
+
+        Vintage Story JSON UVs are in pixel space, but Blender UVs are normalized (0..1).
+        The importer stores the declared texture size on the scene as:
+          - scene["vs_textureWidth"], scene["vs_textureHeight"]
+        Prefer those when present. Otherwise, try to read the first image texture node
+        on the object's active material. Fall back to a small default.
+        """
+        # 1) Declared size from imported JSON (most reliable for VS workflows)
+        try:
+            scn = context.scene
+            tw = float(scn.get("vs_textureWidth") or 0)
+            th = float(scn.get("vs_textureHeight") or 0)
+            if tw > 0 and th > 0:
+                return tw, th
+        except Exception:
+            pass
+
+        # 2) Image node size from material
+        try:
+            if obj is not None:
+                mat = getattr(obj, "active_material", None)
+                if mat is None and getattr(obj, "material_slots", None):
+                    if len(obj.material_slots) > 0:
+                        mat = obj.material_slots[0].material
+                if mat is not None and mat.node_tree is not None:
+                    for n in mat.node_tree.nodes:
+                        if isinstance(n, bpy.types.ShaderNodeTexImage) and getattr(n, "image", None) is not None:
+                            img = n.image
+                            if getattr(img, "size", None) is not None and img.size[0] > 0 and img.size[1] > 0:
+                                return float(img.size[0]), float(img.size[1])
+        except Exception:
+            pass
+
+        # 3) Fallback
+        ds = float(max(1, int(default_size)))
+        return ds, ds
+
+    # When enabled, UVs are written in normalized 0..1 space (recommended for export).
+    normalize_to_texture: bpy.props.BoolProperty(
+        name="Normalize to Texture",
+        description="Scale the generated UV strip by the active/declared texture size so it fits the 0..1 UV tile",
+        default=True,
+    )
+
+    # If > 0, overrides automatic texture size detection. Treats as square unless Y override is also set.
+    texture_size: bpy.props.IntProperty(
+        name="Texture Size",
+        description="Override texture size used for UV normalization (0 = auto; typical VS entity textures are 32, 64, 128, 256, 512)",
+        default=0,
+        min=0,
+    )
+
+    texture_size_y: bpy.props.IntProperty(
+        name="Texture Size Y",
+        description="Override texture height used for UV normalization (0 = use Texture Size / auto)",
+        default=0,
+        min=0,
+    )
+
+    margin: bpy.props.FloatProperty(
+        name="Margin",
+        description="Spacing between strips (in model units / pixels before normalization)",
+        default=0.0,
+        min=0.0,
+    )
+
+    ORDER_ENUM = (
+        (
+            "AUTO",
+            "Auto",
+            "Use selection history when it fully represents the selection; otherwise use viewport order",
+        ),
+        (
+            "SELECTION",
+            "Selection",
+            "Order strips by face selection order (first selected ends up highest in the UV stack)",
+        ),
+        (
+            "VIEWPORT",
+            "Viewport",
+            "Order strips by viewport position (visually higher ends up higher in the UV stack)",
+        ),
+    )
+
+    order_mode: bpy.props.EnumProperty(
+        name="Order",
+        description="How to determine the vertical order of generated UV strips",
+        items=ORDER_ENUM,
+        default="AUTO",
+    )
+
+    order_mode: bpy.props.EnumProperty(
+        name="Order",
+        description="How to order multiple selected middle faces when stacking UV strips",
+        default="AUTO",
+        items=ORDER_ENUM,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context, "mode", "") == "EDIT_MESH" and getattr(context, "edit_object", None) is not None
+
+    def execute(self, context):
+        import bmesh
+        from mathutils import Vector
+
+        # -----------------------------
+        # View helpers (for left/right)
+        # -----------------------------
+        def _get_view_matrix(ctx):
+            """Return the active 3D View's view_matrix (world -> view), or None."""
+            # Prefer current area
+            area = getattr(ctx, "area", None)
+            if area is not None and area.type == "VIEW_3D":
+                rv3d = getattr(getattr(ctx, "space_data", None), "region_3d", None)
+                if rv3d is not None:
+                    return rv3d.view_matrix.copy()
+
+            # Fallback: search any VIEW_3D in current screen
+            scr = getattr(getattr(ctx, "window", None), "screen", None) or getattr(ctx, "screen", None)
+            if scr is None:
+                return None
+            for a in getattr(scr, "areas", []):
+                if a.type != "VIEW_3D":
+                    continue
+                sp = a.spaces.active if getattr(a, "spaces", None) else None
+                rv3d = getattr(sp, "region_3d", None)
+                if rv3d is not None:
+                    return rv3d.view_matrix.copy()
+            return None
+
+        view_mat = _get_view_matrix(context)
+
+        def _face_center_local(f: bmesh.types.BMFace) -> Vector:
+            # Median center is stable for quads
+            try:
+                return f.calc_center_median()
+            except Exception:
+                s = Vector((0.0, 0.0, 0.0))
+                for v in f.verts:
+                    s += v.co
+                return s / max(1, len(f.verts))
+
+        def _to_view2d(obj, local_co: Vector) -> Vector:
+            """Return 2D view-plane coords (x=right, y=up)."""
+            if view_mat is None:
+                return Vector((0.0, 0.0))
+            w = obj.matrix_world @ local_co
+            v = view_mat @ w
+            return Vector((v.x, v.y))
+
+        # -----------------------------
+        # Multi-object edit mode support
+        # -----------------------------
+        edit_objs = list(getattr(context, "objects_in_mode", []) or [])
+        if not edit_objs and getattr(context, "edit_object", None) is not None:
+            edit_objs = [context.edit_object]
+
+        # Stabilize object processing order: active edit object first, then by name.
+        active_obj = getattr(context, "edit_object", None) or getattr(context, "active_object", None)
+        if active_obj in edit_objs:
+            rest = [o for o in edit_objs if o is not None and o is not active_obj]
+            rest.sort(key=lambda o: getattr(o, "name", ""))
+            edit_objs = [active_obj] + rest
+        else:
+            edit_objs = [o for o in edit_objs if o is not None]
+            edit_objs.sort(key=lambda o: getattr(o, "name", ""))
+
+        any_done = False
+        y_cursor_global = 0.0
+        margin = float(getattr(self, "margin", 0.0) or 0.0)
+
+        for obj in edit_objs:
+            if obj is None or obj.type != "MESH":
+                continue
+
+            me = obj.data
+            bm = bmesh.from_edit_mesh(me)
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.verify()
+
+            selected_faces = [f for f in bm.faces if f.select]
+            if not selected_faces:
+                continue
+
+            # Track which faces/UVs we actually write so we can select them afterwards.
+            affected_faces = set()
+
+            # -----------------------------
+            # Determine normalization scale
+            # -----------------------------
+            tex_w = tex_h = None
+            if getattr(self, "normalize_to_texture", True):
+                try:
+                    if int(getattr(self, "texture_size", 0) or 0) > 0:
+                        tw = float(int(self.texture_size))
+                        th = float(int(self.texture_size_y) or 0) if int(getattr(self, "texture_size_y", 0) or 0) > 0 else tw
+                        tex_w, tex_h = tw, th
+                    else:
+                        tex_w, tex_h = self._infer_texture_size(context, obj)
+                except Exception:
+                    tex_w, tex_h = self._infer_texture_size(context, obj)
+
+                if tex_w is None or tex_h is None or tex_w <= 0 or tex_h <= 0:
+                    tex_w, tex_h = float(32), float(32)
+
+            # -------------------------------------------------
+            # Face order (top-to-bottom desired):
+            #   - Selection: based on select history (click order)
+            #   - Viewport: higher on screen first
+            #   - Auto: selection if history fully covers, else viewport
+            # -------------------------------------------------
+            sel_set = set(selected_faces)
+
+            # A) selection history order
+            history_faces = []
+            try:
+                for elem in bm.select_history:
+                    if isinstance(elem, bmesh.types.BMFace) and elem in sel_set:
+                        if elem not in history_faces:
+                            history_faces.append(elem)
+            except Exception:
+                history_faces = []
+
+            history_complete = (len(history_faces) == len(sel_set)) and (set(history_faces) == sel_set)
+
+            # B) viewport order (higher on screen first). Use face index as stable tiebreak.
+            def _viewport_key(f: bmesh.types.BMFace):
+                c2 = _to_view2d(obj, _face_center_local(f))
+                # Sort by y desc, then x desc (so top-right comes before top-left), then face index.
+                return (-float(c2.y), -float(c2.x), int(getattr(f, "index", 0)))
+
+            viewport_faces = sorted(selected_faces, key=_viewport_key)
+
+            # C) decide final order
+            mode = getattr(self, "order_mode", "AUTO")
+            if mode == "VIEWPORT":
+                ordered = viewport_faces
+            elif mode == "SELECTION":
+                ordered = list(history_faces)
+                # Append missing faces in a stable way (viewport order if possible)
+                missing = [f for f in viewport_faces if f not in ordered]
+                ordered.extend(missing)
+            else:  # AUTO
+                if history_complete:
+                    ordered = history_faces
+                else:
+                    ordered = viewport_faces
+
+            # -------------------------------------------------
+            # Decide whether the selection is "vertical" or "horizontal"
+            # in the viewport (assumed not mixed).
+            # -------------------------------------------------
+            centers_v2 = [_to_view2d(obj, _face_center_local(f)) for f in ordered]
+            if centers_v2:
+                xs = [c.x for c in centers_v2]
+                ys = [c.y for c in centers_v2]
+                span_x = max(xs) - min(xs)
+                span_y = max(ys) - min(ys)
+            else:
+                span_x = span_y = 0.0
+
+            selection_is_vertical = (span_y >= span_x)
+            # Rule from you:
+            #  - Vertical selection: Right is right, Left is left (use view X)
+            #  - Horizontal selection: Up is right, Down is left (use view Y)
+            side_axis_2d = Vector((1.0, 0.0)) if selection_is_vertical else Vector((0.0, 1.0))
+
+            # -------------------------------------------------
+            # Stack order: make TOP->BOTTOM match selection order.
+            # UV Y increases upward, so we place in reverse so the earliest
+            # selected ends up highest.
+            # -------------------------------------------------
+            mids_for_stacking = list(reversed(ordered))
+
+            # Process each selected face as a separate "middle".
+            for mid in mids_for_stacking:
+                # Adjacent faces of this selected face
+                adj = set()
+                for e in mid.edges:
+                    for lf in e.link_faces:
+                        if lf is not mid:
+                            adj.add(lf)
+                if len(adj) < 2:
+                    continue
+
+                mid_center_v2 = _to_view2d(obj, _face_center_local(mid))
+
+                # Pick left/right based on viewport direction
+                left_face = None
+                right_face = None
+                best_min = 1e30
+                best_max = -1e30
+                for f in adj:
+                    dv = _to_view2d(obj, _face_center_local(f)) - mid_center_v2
+                    t = dv.dot(side_axis_2d)
+                    if t < best_min:
+                        best_min = t
+                        left_face = f
+                    if t > best_max:
+                        best_max = t
+                        right_face = f
+
+                if left_face is None or right_face is None or left_face is right_face:
+                    continue
+
+                # Determine seam edges (shared verts) for flipping + basis.
+                mid_verts = set(v.index for v in mid.verts)
+                left_shared = [v for v in left_face.verts if v.index in mid_verts]
+                right_shared = [v for v in right_face.verts if v.index in mid_verts]
+                if len(left_shared) != 2 or len(right_shared) != 2:
+                    # Not a clean cuboid adjacency; skip.
+                    continue
+
+                # -----------------------------
+                # Cuboid-clean basis
+                # -----------------------------
+                mid_n = mid.normal.normalized()
+
+                # V axis: seam direction (shared edge) so seams line up.
+                v_dir = (left_shared[1].co - left_shared[0].co)
+                if v_dir.length <= 1e-10:
+                    v_dir = (right_shared[1].co - right_shared[0].co)
+                if v_dir.length <= 1e-10:
+                    continue
+                v_dir.normalize()
+
+                # Ensure v_dir is in the mid plane.
+                v_mid = v_dir - mid_n * v_dir.dot(mid_n)
+                if v_mid.length <= 1e-10:
+                    continue
+                v_mid.normalize()
+
+                # U axis for mid: perpendicular to V in the face plane.
+                u_mid = mid_n.cross(v_mid)
+                if u_mid.length <= 1e-10:
+                    continue
+                u_mid.normalize()
+
+                # Orient U to point toward the viewport "right" face choice.
+                # We do this in view space so rotated cuboids behave consistently.
+                test_v2 = _to_view2d(obj, _face_center_local(mid) + u_mid)
+                if (test_v2 - mid_center_v2).dot(side_axis_2d) < 0.0:
+                    u_mid = -u_mid
+
+                # Side faces: keep the SAME V direction (projected to each plane)
+                # and wrap U around the corner using +/- mid normal.
+                def _proj_to_face_plane(face, vec: Vector) -> Vector:
+                    n = face.normal.normalized()
+                    v = vec - n * vec.dot(n)
+                    if v.length <= 1e-10:
+                        return Vector((0.0, 0.0, 0.0))
+                    v.normalize()
+                    return v
+
+                vL = _proj_to_face_plane(left_face, v_mid)
+                vR = _proj_to_face_plane(right_face, v_mid)
+                if vL.length <= 1e-10 or vR.length <= 1e-10:
+                    continue
+
+                # Keep V consistent direction across faces
+                if vL.dot(v_mid) < 0.0:
+                    vL = -vL
+                if vR.dot(v_mid) < 0.0:
+                    vR = -vR
+
+                uL = _proj_to_face_plane(left_face, (-mid_n))
+                if uL.length <= 1e-10:
+                    uL = vL.cross(left_face.normal.normalized())
+                    if uL.length <= 1e-10:
+                        continue
+                    uL.normalize()
+
+                uR = _proj_to_face_plane(right_face, (mid_n))
+                if uR.length <= 1e-10:
+                    uR = vR.cross(right_face.normal.normalized())
+                    if uR.length <= 1e-10:
+                        continue
+                    uR.normalize()
+
+                # Build UV rectangles.
+                mid_uvs, w_mid, h_mid = _project_uv_rect(mid, uv_layer, u_dir=u_mid, v_dir=v_mid)
+                left_uvs, w_left, h_left = _project_uv_rect(left_face, uv_layer, u_dir=uL, v_dir=vL)
+                right_uvs, w_right, h_right = _project_uv_rect(right_face, uv_layer, u_dir=uR, v_dir=vR)
+
+                # Flip left/right so seams touch the middle properly.
+                def _avg_u_on_verts(face_uvs, face, vert_indices):
+                    vals = []
+                    for loop in face.loops:
+                        if loop.vert.index in vert_indices:
+                            vals.append(face_uvs[loop].x)
+                    return sum(vals) / max(1, len(vals))
+
+                left_shared_idx = {v.index for v in left_shared}
+                right_shared_idx = {v.index for v in right_shared}
+
+                seam_u_left = _avg_u_on_verts(left_uvs, left_face, left_shared_idx)
+                if abs(seam_u_left - 0.0) < abs(seam_u_left - w_left):
+                    for loop in left_face.loops:
+                        uv = left_uvs[loop]
+                        left_uvs[loop] = Vector((w_left - uv.x, uv.y))
+
+                seam_u_right = _avg_u_on_verts(right_uvs, right_face, right_shared_idx)
+                if abs(seam_u_right - w_right) < abs(seam_u_right - 0.0):
+                    for loop in right_face.loops:
+                        uv = right_uvs[loop]
+                        right_uvs[loop] = Vector((w_right - uv.x, uv.y))
+
+                # Vertical alignment: use the tallest face as strip height.
+                strip_h = max(h_left, h_mid, h_right)
+
+                # Center-align strip in X within the texture, if we know tex size.
+                total_w = w_left + w_mid + w_right
+                if tex_w is not None:
+                    x0 = max(0.0, (float(tex_w) - float(total_w)) * 0.5)
+                else:
+                    x0 = 0.0
+
+                left_off = Vector((x0, y_cursor_global))
+                mid_off = Vector((x0 + w_left, y_cursor_global))
+                right_off = Vector((x0 + w_left + w_mid, y_cursor_global))
+
+                # Write UVs (normalize if requested)
+                if tex_w is not None and tex_h is not None:
+                    inv_w = 1.0 / float(tex_w)
+                    inv_h = 1.0 / float(tex_h)
+                    for loop in left_face.loops:
+                        uv = left_uvs[loop] + left_off
+                        loop[uv_layer].uv = Vector((uv.x * inv_w, uv.y * inv_h))
+                    for loop in mid.loops:
+                        uv = mid_uvs[loop] + mid_off
+                        loop[uv_layer].uv = Vector((uv.x * inv_w, uv.y * inv_h))
+                    for loop in right_face.loops:
+                        uv = right_uvs[loop] + right_off
+                        loop[uv_layer].uv = Vector((uv.x * inv_w, uv.y * inv_h))
+                else:
+                    for loop in left_face.loops:
+                        loop[uv_layer].uv = left_uvs[loop] + left_off
+                    for loop in mid.loops:
+                        loop[uv_layer].uv = mid_uvs[loop] + mid_off
+                    for loop in right_face.loops:
+                        loop[uv_layer].uv = right_uvs[loop] + right_off
+
+                affected_faces.update((left_face, mid, right_face))
+
+                y_cursor_global += strip_h + margin
+                any_done = True
+
+
+
+            # Make all UVs we touched selected so transforms (grab/move/pack) affect the whole unwrap.
+            if affected_faces:
+                # Keep existing face selection, but ensure the affected faces are included.
+                for f in affected_faces:
+                    try:
+                        f.select_set(True)
+                    except Exception:
+                        f.select = True
+
+                # UV selection is separate from face selection when UV Sync is off, so manage it directly.
+                try:
+                    for f in bm.faces:
+                        for loop in f.loops:
+                            luv = loop[uv_layer]
+                            if hasattr(luv, "select"):
+                                luv.select = False
+                            if hasattr(luv, "select_edge"):
+                                luv.select_edge = False
+                    for f in affected_faces:
+                        for loop in f.loops:
+                            luv = loop[uv_layer]
+                            if hasattr(luv, "select"):
+                                luv.select = True
+                            if hasattr(luv, "select_edge"):
+                                luv.select_edge = True
+                except Exception:
+                    pass
+
+            bmesh.update_edit_mesh(me, loop_triangles=False, destructive=False)
+
+        if not any_done:
+            self.report({"WARNING"}, "No suitable quad faces found, or could not determine left/right adjacency")
+        return {"FINISHED"}
+
+
+class OpUVSingleDirectionUnwrap(bpy.types.Operator):
+    """Unwrap ONLY the selected face(s) using the same directional basis logic as Directional Entity Unwrap.
+
+    Unlike Directional Entity Unwrap, this does not add the adjacent left/right faces to the UV strip.
+    It still *uses* adjacency to infer orientation (cuboid workflow).
+    """
+    bl_idname = "vintagestory.uv_single_direction_unwrap"
+    bl_label = "Single Direction Unwrap"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def _infer_texture_size(self, context, obj=None, *, default_size: int = 32) -> tuple[float, float]:
+        # 1) Declared size from imported JSON (most reliable for VS workflows)
+        try:
+            scn = context.scene
+            tw = float(scn.get("vs_textureWidth") or 0)
+            th = float(scn.get("vs_textureHeight") or 0)
+            if tw > 0 and th > 0:
+                return tw, th
+        except Exception:
+            pass
+
+        # 2) Image node size from material
+        try:
+            if obj is not None:
+                mat = getattr(obj, "active_material", None)
+                if mat is None and getattr(obj, "material_slots", None):
+                    if len(obj.material_slots) > 0:
+                        mat = obj.material_slots[0].material
+                if mat is not None and mat.node_tree is not None:
+                    for n in mat.node_tree.nodes:
+                        if isinstance(n, bpy.types.ShaderNodeTexImage) and getattr(n, "image", None) is not None:
+                            img = n.image
+                            if getattr(img, "size", None) is not None and img.size[0] > 0 and img.size[1] > 0:
+                                return float(img.size[0]), float(img.size[1])
+        except Exception:
+            pass
+
+        ds = float(max(1, int(default_size)))
+        return ds, ds
+
+    normalize_to_texture: bpy.props.BoolProperty(
+        name="Normalize to Texture",
+        description="Scale the generated UVs by the active/declared texture size so it fits the 0..1 UV tile",
+        default=True,
+    )
+
+    texture_size: bpy.props.IntProperty(
+        name="Texture Size",
+        description="Override texture size used for UV normalization (0 = auto)",
+        default=0,
+        min=0,
+    )
+
+    texture_size_y: bpy.props.IntProperty(
+        name="Texture Size Y",
+        description="Override texture height used for UV normalization (0 = use Texture Size / auto)",
+        default=0,
+        min=0,
+    )
+
+    margin: bpy.props.FloatProperty(
+        name="Margin",
+        description="Spacing between stacked results (in model units / pixels before normalization)",
+        default=0.0,
+        min=0.0,
+    )
+
+    ORDER_ENUM = (
+        ("AUTO", "Auto", "Use selection history when it fully represents the selection; otherwise use viewport order"),
+        ("SELECTION", "Selection", "Order by face selection order"),
+        ("VIEWPORT", "Viewport", "Order by viewport position (higher ends up higher in the UV stack)"),
+    )
+
+    order_mode: bpy.props.EnumProperty(
+        name="Order",
+        description="How to order multiple selected faces when stacking results",
+        items=ORDER_ENUM,
+        default="AUTO",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context, "mode", "") == "EDIT_MESH" and getattr(context, "edit_object", None) is not None
+
+    def execute(self, context):
+        import bmesh
+        from mathutils import Vector
+
+        # -----------------------------
+        # View helpers (for orientation)
+        # -----------------------------
+        def _get_view_matrix(ctx):
+            area = getattr(ctx, "area", None)
+            if area is not None and area.type == "VIEW_3D":
+                rv3d = getattr(getattr(ctx, "space_data", None), "region_3d", None)
+                if rv3d is not None:
+                    return rv3d.view_matrix.copy()
+
+            scr = getattr(getattr(ctx, "window", None), "screen", None) or getattr(ctx, "screen", None)
+            if scr is None:
+                return None
+            for a in getattr(scr, "areas", []):
+                if a.type != "VIEW_3D":
+                    continue
+                sp = a.spaces.active if getattr(a, "spaces", None) else None
+                rv3d = getattr(sp, "region_3d", None)
+                if rv3d is not None:
+                    return rv3d.view_matrix.copy()
+            return None
+
+        view_mat = _get_view_matrix(context)
+
+        def _face_center_local(f: bmesh.types.BMFace) -> Vector:
+            try:
+                return f.calc_center_median()
+            except Exception:
+                s = Vector((0.0, 0.0, 0.0))
+                for v in f.verts:
+                    s += v.co
+                return s / max(1, len(f.verts))
+
+        def _to_view2d(obj, local_co: Vector) -> Vector:
+            if view_mat is None:
+                return Vector((0.0, 0.0))
+            w = obj.matrix_world @ local_co
+            v = view_mat @ w
+            return Vector((v.x, v.y))
+
+        # Multi-object edit mode support
+        edit_objs = list(getattr(context, "objects_in_mode", []) or [])
+        if not edit_objs and getattr(context, "edit_object", None) is not None:
+            edit_objs = [context.edit_object]
+
+        active_obj = getattr(context, "edit_object", None) or getattr(context, "active_object", None)
+        if active_obj in edit_objs:
+            rest = [o for o in edit_objs if o is not None and o is not active_obj]
+            rest.sort(key=lambda o: getattr(o, "name", ""))
+            edit_objs = [active_obj] + rest
+        else:
+            edit_objs = [o for o in edit_objs if o is not None]
+            edit_objs.sort(key=lambda o: getattr(o, "name", ""))
+
+        any_done = False
+        y_cursor_global = 0.0
+        margin = float(getattr(self, "margin", 0.0) or 0.0)
+
+        for obj in edit_objs:
+            if obj is None or obj.type != "MESH":
+                continue
+
+            me = obj.data
+            bm = bmesh.from_edit_mesh(me)
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.verify()
+
+            selected_faces = [f for f in bm.faces if f.select]
+            if not selected_faces:
+                continue
+
+            affected_faces = set()
+
+            # Determine normalization scale
+            tex_w = tex_h = None
+            if getattr(self, "normalize_to_texture", True):
+                try:
+                    if int(getattr(self, "texture_size", 0) or 0) > 0:
+                        tw = float(int(self.texture_size))
+                        th = float(int(self.texture_size_y) or 0) if int(getattr(self, "texture_size_y", 0) or 0) > 0 else tw
+                        tex_w, tex_h = tw, th
+                    else:
+                        tex_w, tex_h = self._infer_texture_size(context, obj)
+                except Exception:
+                    tex_w, tex_h = self._infer_texture_size(context, obj)
+
+                if tex_w is None or tex_h is None or tex_w <= 0 or tex_h <= 0:
+                    tex_w, tex_h = float(32), float(32)
+
+            # Order faces (same logic as directional unwrap)
+            sel_set = set(selected_faces)
+
+            history_faces = []
+            try:
+                for elem in bm.select_history:
+                    if isinstance(elem, bmesh.types.BMFace) and elem in sel_set:
+                        if elem not in history_faces:
+                            history_faces.append(elem)
+            except Exception:
+                history_faces = []
+
+            history_complete = (len(history_faces) == len(sel_set)) and (set(history_faces) == sel_set)
+
+            def _viewport_key(f: bmesh.types.BMFace):
+                c2 = _to_view2d(obj, _face_center_local(f))
+                return (-float(c2.y), -float(c2.x), int(getattr(f, "index", 0)))
+
+            viewport_faces = sorted(selected_faces, key=_viewport_key)
+
+            mode = getattr(self, "order_mode", "AUTO")
+            if mode == "VIEWPORT":
+                ordered = viewport_faces
+            elif mode == "SELECTION":
+                ordered = list(history_faces)
+                missing = [f for f in viewport_faces if f not in ordered]
+                ordered.extend(missing)
+            else:  # AUTO
+                ordered = history_faces if history_complete else viewport_faces
+
+            centers_v2 = [_to_view2d(obj, _face_center_local(f)) for f in ordered]
+            if centers_v2:
+                xs = [c.x for c in centers_v2]
+                ys = [c.y for c in centers_v2]
+                span_x = max(xs) - min(xs)
+                span_y = max(ys) - min(ys)
+            else:
+                span_x = span_y = 0.0
+
+            selection_is_vertical = (span_y >= span_x)
+            side_axis_2d = Vector((1.0, 0.0)) if selection_is_vertical else Vector((0.0, 1.0))
+
+            # Stack order: top-to-bottom matches selection order
+            faces_for_stacking = list(reversed(ordered))
+
+            for mid in faces_for_stacking:
+                # Cuboid-only: must be a quad
+                if len(mid.loops) != 4:
+                    continue
+
+                # Adjacent faces are used only to infer orientation
+                adj = set()
+                for e in mid.edges:
+                    for lf in e.link_faces:
+                        if lf is not mid:
+                            adj.add(lf)
+                if not adj:
+                    continue
+
+                mid_center_v2 = _to_view2d(obj, _face_center_local(mid))
+
+                left_face = None
+                right_face = None
+                best_min = 1e30
+                best_max = -1e30
+                for f in adj:
+                    dv = _to_view2d(obj, _face_center_local(f)) - mid_center_v2
+                    t = dv.dot(side_axis_2d)
+                    if t < best_min:
+                        best_min = t
+                        left_face = f
+                    if t > best_max:
+                        best_max = t
+                        right_face = f
+
+                # Pick a seam edge (shared verts) to define V direction
+                mid_verts = set(v.index for v in mid.verts)
+                seam_shared = None
+                if left_face is not None:
+                    left_shared = [v for v in left_face.verts if v.index in mid_verts]
+                    if len(left_shared) == 2:
+                        seam_shared = left_shared
+                if seam_shared is None and right_face is not None:
+                    right_shared = [v for v in right_face.verts if v.index in mid_verts]
+                    if len(right_shared) == 2:
+                        seam_shared = right_shared
+                if seam_shared is None:
+                    continue
+
+                mid_n = mid.normal.normalized()
+
+                v_dir = (seam_shared[1].co - seam_shared[0].co)
+                if v_dir.length <= 1e-10:
+                    continue
+                v_dir.normalize()
+
+                v_mid = v_dir - mid_n * v_dir.dot(mid_n)
+                if v_mid.length <= 1e-10:
+                    continue
+                v_mid.normalize()
+
+                u_mid = mid_n.cross(v_mid)
+                if u_mid.length <= 1e-10:
+                    continue
+                u_mid.normalize()
+
+                # Orient U to point toward the viewport "right" direction.
+                test_v2 = _to_view2d(obj, _face_center_local(mid) + u_mid)
+                if (test_v2 - mid_center_v2).dot(side_axis_2d) < 0.0:
+                    u_mid = -u_mid
+
+                # Project to UV rectangle and write
+                try:
+                    mid_uvs, w_mid, h_mid = _project_uv_rect(mid, uv_layer, u_dir=u_mid, v_dir=v_mid)
+                except Exception:
+                    continue
+
+                if tex_w is not None:
+                    x0 = max(0.0, (float(tex_w) - float(w_mid)) * 0.5)
+                else:
+                    x0 = 0.0
+
+                off = Vector((x0, y_cursor_global))
+
+                if tex_w is not None and tex_h is not None:
+                    inv_w = 1.0 / float(tex_w)
+                    inv_h = 1.0 / float(tex_h)
+                    for loop in mid.loops:
+                        uv = mid_uvs[loop] + off
+                        loop[uv_layer].uv = Vector((uv.x * inv_w, uv.y * inv_h))
+                else:
+                    for loop in mid.loops:
+                        loop[uv_layer].uv = mid_uvs[loop] + off
+
+                affected_faces.add(mid)
+                y_cursor_global += float(h_mid) + margin
+                any_done = True
+
+            # Select UVs we touched (and keep face selection inclusive)
+            if affected_faces:
+                for f in affected_faces:
+                    try:
+                        f.select_set(True)
+                    except Exception:
+                        f.select = True
+
+                try:
+                    for f in bm.faces:
+                        for loop in f.loops:
+                            luv = loop[uv_layer]
+                            if hasattr(luv, "select"):
+                                luv.select = False
+                            if hasattr(luv, "select_edge"):
+                                luv.select_edge = False
+                    for f in affected_faces:
+                        for loop in f.loops:
+                            luv = loop[uv_layer]
+                            if hasattr(luv, "select"):
+                                luv.select = True
+                            if hasattr(luv, "select_edge"):
+                                luv.select_edge = True
+                except Exception:
+                    pass
+
+            bmesh.update_edit_mesh(me, loop_triangles=False, destructive=False)
+
+        if not any_done:
+            self.report({"WARNING"}, "No suitable quad faces found, or could not infer orientation from adjacency")
+        return {"FINISHED"}
+
+
 DISABLE_MATERIAL_ENUM = (
     # (ID, Name, Description, Icon, Number)
     ("ENABLE", "Enable Material", "Enable material", "SNAP_VOLUME", 0),

@@ -1748,22 +1748,6 @@ def save_all_animations(
 
         keyframes_out = []
         any_motion = False
-        # Track previous VS-space euler angles per emitted element name so we can
-        # keep continuity when converting from quaternions (or ambiguous euler branches).
-        prev_rot = {}
-
-        def unwrap_axis(prev_val, cur_val):
-            """Return cur_val adjusted by +/-360*n to be closest to prev_val."""
-            try:
-                pv = float(prev_val)
-                cv = float(cur_val)
-                if not math.isfinite(pv) or not math.isfinite(cv):
-                    return cv
-                k = int(round((pv - cv) / 360.0))
-                return cv + 360.0 * k
-            except Exception:
-                return cur_val
-
         # Precompute rest matrices in world space
         rest_world = {}
         for bn in bones_to_eval:
@@ -1838,16 +1822,7 @@ def save_all_animations(
                 rot_y = safe_f(r[1])
                 rot_z = safe_f(r[2])
 
-                # Optional: keep Euler continuity between sampled frames.
-                # This is useful when Blender authored quaternion motion (slerp) is converted
-                # to Euler and the representation "jumps" by ±360 even though rotation is smooth.
                 out_name = bone_export_name(db)
-                if rotate_shortest_distance and out_name in prev_rot:
-                    prx, pry, prz = prev_rot[out_name]
-                    rot_x = unwrap_axis(prx, rot_x)
-                    rot_y = unwrap_axis(pry, rot_y)
-                    rot_z = unwrap_axis(prz, rot_z)
-
                 # snap tiny values to 0
                 if near_zero(off_x, tol_loc): off_x = 0.0
                 if near_zero(off_y, tol_loc): off_y = 0.0
@@ -1877,9 +1852,6 @@ def save_all_animations(
                     el["rotShortestDistanceZ"] = True
 
                 frame_elements[out_name] = el
-
-                if rotate_shortest_distance:
-                    prev_rot[out_name] = (rot_x, rot_y, rot_z)
 
             # Don't emit empty keyframes
             if frame_elements:

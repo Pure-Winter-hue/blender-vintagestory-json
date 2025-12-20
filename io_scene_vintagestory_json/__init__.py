@@ -232,15 +232,11 @@ class ExportVintageStoryJson(Operator, ExportHelper):
     )
 
     rotate_shortest_distance: BoolProperty(
-        name="Shortest-Path Rotations",
-        description=(
-            "Improve in-game rotation interpolation for animations authored in quaternion mode by "
-            "(a) unwrapping Euler windings during export and (b) setting rotShortestDistance flags "
-            "on keyframes. Enable this when VSMC looks correct but the game takes the long way around."
-        ),
+        name="Rotate Shortest Distance",
+        description="Use shortest distance interpolation for rotation keyframes",
         default=False,
     )
-
+    
     bake_animations: BoolProperty(
         name="Bake Animations",
         description=(
