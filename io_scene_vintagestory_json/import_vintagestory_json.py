@@ -156,6 +156,10 @@ def parse_element(
         new_cube_origin,       # global space cube corner origin
         new_rotation_origin    # local space rotation (Blender) origin
     """
+    # name-based helpers
+    vs_name = e.get("name") or "cube"
+    is_storage = isinstance(vs_name, str) and ("storage" in vs_name.casefold())
+
     # get cube min/max
     v_min = np.array([e["from"][2], e["from"][0], e["from"][1]])
     v_max = np.array([e["to"][2], e["to"][0], e["to"][1]])
@@ -196,6 +200,11 @@ def parse_element(
     mesh = obj.data
     mesh_materials = {} # tex_name => material_index
 
+    # NOTE: We intentionally do NOT strip faces here.
+    # The importer below still needs a valid cube mesh (verts + polys) to assign coordinates and UVs.
+    # We'll convert storage volumes to a faceless wire helper at the end of this function.
+
+
     # center local mesh coordiantes
     v_min = v_min - child_rotation_origin
     v_max = v_max - child_rotation_origin
@@ -221,23 +230,15 @@ def parse_element(
 
     # -------------------------------------------------------------------------
     # Disabled faces (VSMC style)
-    # A face may be disabled by setting face["enabled"]=false OR by setting its UV rect to all zeros.
-    # We represent a disabled face in Blender by deleting that quad from the cuboid mesh (visual-only).
+    # A face may be disabled by setting face["enabled"]=false.
+    # (We DO NOT treat 0-UV as disabled, because artists sometimes intentionally place UVs at 0,0
+    # e.g. hair cards, and we don't want that to get nuked or shown as "red".)
     # -------------------------------------------------------------------------
     def _is_disabled_face(face_dict):
         if not isinstance(face_dict, dict):
             return False
         if face_dict.get("enabled", True) is False:
             return True
-        uv = face_dict.get("uv")
-        if isinstance(uv, (list, tuple)):
-            try:
-                uv_f = [float(x) for x in uv]
-            except Exception:
-                uv_f = []
-            if len(uv_f) >= 2 and all(abs(x) < 1e-9 for x in uv_f):
-                # Handles [0,0,0,0] and also oddball [0,0,0] exports
-                return True
         return False
     
     disabled_dirs = {d for d, fdict in uv_faces.items() if _is_disabled_face(fdict)}
@@ -280,6 +281,8 @@ def parse_element(
     if element_uv0 is not None:
         try:
             # JSON coords: x, y, z
+            x1, y1, z1 = float(e["from"][0]), float(e["from"][1]), float(e["from"][2])
+            x2, y2, z2 = float(e["to"][0]), float(e["to"][1]), float(e["to"][2])
             dx = abs(x2 - x1)
             dy = abs(y2 - y1)
             dz = abs(z2 - z1)
@@ -341,7 +344,9 @@ def parse_element(
         # neither passes strict checks, fall back to A
         return a
 
-    if import_uvs and (uv_faces or auto_uv_rects is not None):
+    # Storage volumes are non-rendering helpers in Vintage Story.
+    # We still import them as selectable objects, but we don't bother importing UVs/materials.
+    if import_uvs and (not is_storage) and (uv_faces or auto_uv_rects is not None):
         # get uvs per face in blender loop order
         uv_layer = mesh.uv_layers.active.data
 
@@ -442,7 +447,6 @@ def parse_element(
 
 
     # set name (store VS name for animation mapping; Blender names may normalize whitespace)
-    vs_name = e.get("name") or "cube"
     obj["vs_name"] = vs_name
     obj.name = vs_name.strip()
     # Remember the Blender-visible name at import time so we can detect user renames later
@@ -451,6 +455,45 @@ def parse_element(
     # assign step parent name
     if "stepParentName" in e:
         obj["StepParentName"] = e.get("stepParentName")
+
+    # ---------------------------------------------------------------------
+    # Storage helper volumes
+    # In VS these are faceless/invisible selection/attachment volumes.
+    # In Blender we represent them as a blue wire box: keep verts/edges, delete ALL faces.
+    # This must happen after vertex assignment and any optional UV work above.
+    # ---------------------------------------------------------------------
+    if is_storage:
+        try:
+            import bmesh
+            bm = bmesh.new()
+            bm.from_mesh(mesh)
+            bm.faces.ensure_lookup_table()
+            if len(bm.faces) > 0:
+                # Prefer FACES_ONLY (keeps verts/edges so the object stays a wireframe box).
+                # Fall back to FACES if the Blender build doesn't support that context.
+                try:
+                    bmesh.ops.delete(bm, geom=list(bm.faces), context="FACES_ONLY")
+                except Exception:
+                    bmesh.ops.delete(bm, geom=list(bm.faces), context="FACES")
+            bm.to_mesh(mesh)
+            bm.free()
+            mesh.update()
+        except Exception as ex:
+            print(f"[VS Import] Failed to strip faces for storage element '{vs_name}': {ex}")
+
+        # Make it obvious (and nice) in the viewport
+        try:
+            obj.display_type = 'WIRE'
+            obj.show_in_front = True
+            obj.color = (0.25, 0.55, 1.0, 1.0)  # blue-ish
+        except Exception:
+            pass
+
+        # Tag for exporter
+        try:
+            obj["vs_is_storage"] = True
+        except Exception:
+            pass
 
     return obj, v_min, new_cube_origin, new_rotation_origin, location, rot_euler
 

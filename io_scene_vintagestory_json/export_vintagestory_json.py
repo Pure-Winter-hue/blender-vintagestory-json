@@ -1039,7 +1039,11 @@ def generate_mesh_element(
         new_element["group"] = users_collection[0].name
 
     # add faces
-    new_element["faces"] = faces
+    # Storage helper volumes: export faceless so VS does not render them.
+    if (isinstance(export_name, str) and ("storage" in export_name.casefold())) or bool(obj.get("vs_is_storage", False) if hasattr(obj,"get") else False):
+        new_element["faces"] = {}
+    else:
+        new_element["faces"] = faces
 
     # add children
     new_element["children"] = children
