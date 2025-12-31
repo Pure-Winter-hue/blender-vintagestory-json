@@ -253,25 +253,41 @@ def parse_element(
 
         try:
             import bmesh
-            # Map current cube polygons to VS face directions by normal.
-            # Map face normal -> direction index, then to direction name.
-            # Works even if the cuboid has < 6 faces (e.g. VSMC-disabled faces).
-            face_normals = np.array([f.normal[:] for f in mesh.polygons], dtype=float)  # (F,3)
-            # Dot each face normal with the 6 canonical axis normals -> (F,6)
-            dots = face_normals @ DIRECTION_NORMALS.T
-            dir_idx = np.argmax(dots, axis=1)
-            face_dirs = DIRECTIONS[dir_idx]
-    
-            delete_poly_indices = [i for i, d in enumerate(face_dirs) if d in disabled_dirs]
-            if delete_poly_indices:
-                bm = bmesh.new()
-                bm.from_mesh(mesh)
-                bm.faces.ensure_lookup_table()
-                for pi in sorted(delete_poly_indices, reverse=True):
-                    if pi < len(bm.faces):
-                        bmesh.ops.delete(bm, geom=[bm.faces[pi]], context="FACES")
-                bm.to_mesh(mesh)
-                bm.free()
+            # IMPORTANT:
+            # Blender's Mesh polygon indexing and bmesh face lookup ordering are not guaranteed
+            # to be identical. The previous implementation deleted by numeric index, which could
+            # result in only one (or the wrong) face being removed when multiple faces are disabled.
+            #
+            # Fix: classify and delete faces directly in bmesh by their normals.
+            bm = bmesh.new()
+            bm.from_mesh(mesh)
+            bm.faces.ensure_lookup_table()
+            # normal_update may not exist on very old Blender/bmesh versions
+            try:
+                bm.normal_update()
+            except Exception:
+                pass
+
+            faces_to_delete = []
+            for f in bm.faces:
+                n = np.array(f.normal[:], dtype=float)
+                # Dot with the 6 canonical axis normals -> (6,)
+                dots = n @ DIRECTION_NORMALS.T
+                di = int(np.argmax(dots))
+                dname = str(DIRECTIONS[di])
+                if dname in disabled_dirs:
+                    faces_to_delete.append(f)
+
+            if faces_to_delete:
+                bmesh.ops.delete(bm, geom=faces_to_delete, context="FACES")
+
+            bm.to_mesh(mesh)
+            bm.free()
+            # Ensure viewport updates immediately
+            try:
+                mesh.update()
+            except Exception:
+                pass
         except Exception as ex:
             print(f"[VS Import] Failed to delete disabled faces: {ex}")
     
