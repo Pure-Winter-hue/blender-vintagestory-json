@@ -729,19 +729,28 @@ def generate_mesh_element(
             if model_colors is not None:
                 model_colors.add(face_material.color)
             continue
-        # texture
-        if face_material.type != FaceMaterial.TEXTURE:
-            continue
 
-        faces[d]["texture"] = "#0"  # VSMC-style disabled face
-        model_textures[face_material.name] = face_material
+        # Texture bookkeeping (but UV export should work even without textures/materials).
+        if face_material.type == FaceMaterial.TEXTURE:
+            faces[d]["texture"] = "#0"  # VSMC-style: single texture slot
+            model_textures[face_material.name] = face_material
 
-        # face glow
-        if face_material.glow > 0:
+        # face glow (allow glow on both textured + color faces)
+        if getattr(face_material, "glow", 0) > 0:
             faces[d]["glow"] = face_material.glow
 
-        tex_width = face_material.texture_size[0] if texture_size_x_override is None else texture_size_x_override
-        tex_height = face_material.texture_size[1] if texture_size_y_override is None else texture_size_y_override
+        # Resolve tex size for pixel-space UV export.
+        # Prefer explicit overrides (or declared VS texture size stored on the scene),
+        # otherwise fall back to the material image size when available, and finally 16.
+        if texture_size_x_override is not None:
+            tex_width = texture_size_x_override
+        else:
+            tex_width = face_material.texture_size[0] if (hasattr(face_material, "texture_size") and face_material.texture_size and face_material.texture_size[0] > 0) else 16
+
+        if texture_size_y_override is not None:
+            tex_height = texture_size_y_override
+        else:
+            tex_height = face_material.texture_size[1] if (hasattr(face_material, "texture_size") and face_material.texture_size and face_material.texture_size[1] > 0) else 16
 
         if not export_uvs:
             continue

@@ -34,6 +34,15 @@ class ImportVintageStoryJson(Operator, ImportHelper):
         default=True,
     )
 
+    import_textures: BoolProperty(
+        name="Import Textures",
+        description="Import textures/materials (required to preserve texture mapping on export)",
+        # Keep legacy behavior of this fork: import without textures by default.
+        # UVs can still round-trip without textures (exporter reads the UV map),
+        # but enabling this is useful if you have the VS texture files available.
+        default=False,
+    )
+
     recenter_to_origin: BoolProperty(
         name="Recenter on Origin",
         description="Recenter model center to origin",
@@ -57,9 +66,7 @@ class ImportVintageStoryJson(Operator, ImportHelper):
         # This is intentionally not exposed as a user-facing option.
         args["translate_origin"] = [-8.0, -8.0, 0.0]
 
-        # Force single-material import workflow: we strip all materials and assign a shared 'skin' material
-        # in the importer post-process, so skip texture/material import entirely.
-        args["import_textures"] = False
+        # If the user disables "Import Textures", the importer will fall back to a single shared "skin" material.
 
         return import_vintagestory_json.load(context, **args)
 

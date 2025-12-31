@@ -1254,8 +1254,10 @@ def load(context,
         except Exception:
             pass
 
-    # Apply single-material policy to imported mesh objects
-    _vs_postprocess_single_skin([o for o in all_objects if isinstance(getattr(o, "data", None), bpy.types.Mesh)])
+    # Apply single-material policy ONLY when textures/materials were not imported.
+    # When importing textures, keep per-face materials so UVs + texture references round-trip.
+    if not import_textures:
+        _vs_postprocess_single_skin([o for o in all_objects if isinstance(getattr(o, "data", None), bpy.types.Mesh)])
 
     # Sync datablock names after the import has finished creating/linking objects
     _vs_sync_object_data_names(all_objects + ([armature] if armature is not None else []))
