@@ -13,6 +13,234 @@ try:
 except ImportError:
     import json
 
+import re
+
+# -----------------------------------------------------------------------------
+# Relaxed JSON loader
+# Vintage Story models in the wild are sometimes "JSON-ish" (JSON5-like):
+# - trailing commas in arrays/objects
+# - // and /* */ comments
+# - unquoted keys (name: value)
+#
+# We keep the optional pyjson5 dependency, but also provide a safe fallback that
+# DOES NOT touch colons inside quoted strings (e.g. Windows drive paths "C:/...").
+# -----------------------------------------------------------------------------
+
+def _vsjson_strip_comments(s: str) -> str:
+    """Remove // and /* */ comments, without touching content inside strings."""
+    out = []
+    i = 0
+    in_str = False
+    esc = False
+
+    while i < len(s):
+        ch = s[i]
+
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == '/' and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt == '/':
+                # line comment: skip until newline, keep newline in output
+                i += 2
+                while i < len(s) and s[i] not in '\r\n':
+                    i += 1
+                continue
+            if nxt == '*':
+                # block comment: skip until */
+                i += 2
+                while i + 1 < len(s) and not (s[i] == '*' and s[i + 1] == '/'):
+                    # preserve newlines so error line numbers stay roughly meaningful
+                    if s[i] in '\r\n':
+                        out.append(s[i])
+                    i += 1
+                i += 2 if i + 1 < len(s) else 0
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return ''.join(out)
+
+
+def _vsjson_strip_trailing_commas(s: str) -> str:
+    """Remove trailing commas before ] or } (JSON5-style), ignoring strings."""
+    out = []
+    i = 0
+    in_str = False
+    esc = False
+
+    while i < len(s):
+        ch = s[i]
+
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ',':
+            j = i + 1
+            while j < len(s) and s[j] in ' \t\r\n':
+                j += 1
+            if j < len(s) and s[j] in '}]':
+                # skip this comma
+                i += 1
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return ''.join(out)
+
+
+def _vsjson_quote_unquoted_keys(s: str) -> str:
+    """Quote bare word keys in objects: { key: value } -> { "key": value }.
+    Safe against colons inside strings. Only targets keys matching \w+.
+    """
+    out = []
+    i = 0
+    in_str = False
+    esc = False
+    stack = []  # '{' or '['
+    expect_key = False  # only true when current container is an object and we're expecting a key
+
+    while i < len(s):
+        ch = s[i]
+
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+
+        # whitespace
+        if ch in ' \t\r\n':
+            out.append(ch)
+            i += 1
+            continue
+
+        # structure tokens
+        if ch == '{':
+            stack.append('{')
+            expect_key = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == '[':
+            stack.append('[')
+            expect_key = False
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == '}':
+            if stack and stack[-1] == '{':
+                stack.pop()
+            expect_key = (stack and stack[-1] == '{')
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ']':
+            if stack and stack[-1] == '[':
+                stack.pop()
+            expect_key = (stack and stack[-1] == '{')
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ':':
+            # after a key in an object
+            expect_key = False
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ',':
+            # after a value (or after a key-value pair), decide what's next based on container
+            expect_key = (stack and stack[-1] == '{')
+            out.append(ch)
+            i += 1
+            continue
+
+        # Potential bare key?
+        if expect_key and stack and stack[-1] == '{' and re.match(r'[A-Za-z_]', ch):
+            j = i + 1
+            while j < len(s) and re.match(r'[A-Za-z0-9_]', s[j]):
+                j += 1
+
+            key = s[i:j]
+
+            k = j
+            while k < len(s) and s[k] in ' \t\r\n':
+                k += 1
+
+            if k < len(s) and s[k] == ':':
+                out.append('"')
+                out.append(key)
+                out.append('"')
+                i = j
+                # keep expect_key True until we hit the ':'
+                continue
+
+        # default passthrough
+        out.append(ch)
+        i += 1
+
+    return ''.join(out)
+
+
+def _vsjson_loads(s: str):
+    """Try strict JSON, then a safe relaxed pre-processing pipeline."""
+    try:
+        return json.loads(s)
+    except Exception:
+        s2 = _vsjson_strip_trailing_commas(_vsjson_strip_comments(s))
+        try:
+            return json.loads(s2)
+        except Exception:
+            s3 = _vsjson_quote_unquoted_keys(s2)
+            return json.loads(s3)
+
 import importlib
 importlib.reload(animation)
 
@@ -371,7 +599,7 @@ def parse_element(
         # canonical face normals (same approach as the original importer).
         # Map face normal -> direction index, then to direction name.
         # Works even if the cuboid has < 6 faces (e.g. VSMC-disabled faces).
-        face_normals = np.array([f.normal[:] for f in mesh.polygons], dtype=float)  # (F,3)
+        face_normals = np.array([f.normal[:] for f in mesh.polygons], dtype=float).reshape((-1, 3))  # (F,3) even when F==0
         # Dot each face normal with the 6 canonical axis normals -> (F,6)
         dots = face_normals @ DIRECTION_NORMALS.T
         dir_idx = np.argmax(dots, axis=1)
@@ -965,22 +1193,10 @@ def load(context,
     t_start = time.process_time()
     stats = ImportStats() if debug_stats else None
 
-    with open(filepath, "r") as f:
+    with open(filepath, "r", encoding="utf-8-sig") as f:
         s = f.read()
-        try:
-            data = json.loads(s)
-        except Exception as err:
-            # sometimes format is in loose json, `name: value` instead of `"name": value`
-            # this tries to add quotes to keys without double quotes
-            # this simple regex fails if any strings contain colons
-            try:
-                import re
-                s2 = re.sub("(\w+):", r'"\1":',  s)
-                data = json.loads(s2)
-            # unhandled issue
-            except Exception as err:
-                raise err
-    
+        data = _vsjson_loads(s)
+
     # chunks of import file path, to get base directory
     filepath_parts = filepath.split(os.path.sep)
 

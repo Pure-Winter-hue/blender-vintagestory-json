@@ -482,7 +482,7 @@ def generate_mesh_element(
         parent_matrix_world = parent_bone.matrix_local.copy()
         parent_cube_origin = parent_bone.head
         parent_rotation_origin = parent_bone.head
-    else:
+    elif step_parent_name is not None:
         print(f"WARNING: cannot find {obj.name} step parent bone {bone_parent_name}")
 
     # more robust but higher performance cost, just get relative
@@ -3099,7 +3099,7 @@ def save_objects(
                         continue
                     for ename, tr in elems_k.items():
                         if ename not in name_set:
-                            errors.append(f"Animation '{acode}' targets missing element '{ename}'.")
+                            warnings.append(f"Animation '{acode}' targets missing element '{ename}' (exporting anyway).")
                             continue
                         if not isinstance(tr, dict):
                             errors.append(f"Animation '{acode}' keyframe {kf.get('frame','?')} element '{ename}' has invalid transform.")
