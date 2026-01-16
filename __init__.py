@@ -2,7 +2,7 @@ bl_info = {
     "name": "Vintage Story JSON Import/Export",
     "description": "Tool for modeling/uv/anim/exporting VS JSON from Blender.",
     "author": "phonon, Pure Winter",
-    "version": (0, 9, 4),
+    "version": (0, 9, 5),
     "blender": (4, 5, 0),
     "location": "File > Import-Export",
     "warning": "",
